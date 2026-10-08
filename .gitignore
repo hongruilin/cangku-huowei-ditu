@@ -1,0 +1,22 @@
+# 数据与运行时产物（不要提交）
+uploads/
+data/
+pgdata/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 环境变量（真实密钥不要进仓库；默认值仅适合本机试用）
+.env
+
+# 打包产物
+*.tar.gz
+*.zip
+
+# 编辑器/系统
+.DS_Store
+.idea/
+.vscode/

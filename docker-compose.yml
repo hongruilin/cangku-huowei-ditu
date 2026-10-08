@@ -1,0 +1,54 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: wms
+      POSTGRES_USER: wms
+      POSTGRES_PASSWORD: ${PGPASSWORD:-wms}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wms -d wms"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      DATABASE_URL: postgresql://wms:${PGPASSWORD:-wms}@db:5432/wms
+      PGHOST: db
+      PGPORT: 5432
+      PGDATABASE: wms
+      PGUSER: wms
+      PGPASSWORD: ${PGPASSWORD:-wms}
+      SESSION_SECRET: ${SESSION_SECRET:-change-me-in-production}
+      ADMIN_USER: ${ADMIN_USER:-admin}
+      ADMIN_PASS: ${ADMIN_PASS:-admin123}
+      UPLOAD_DIR: /app/uploads
+    volumes:
+      - ./uploads:/app/uploads
+      - ./data:/app/data
+
+  mcp:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${MCP_PORT:-8001}:8001"
+    environment:
+      DATABASE_URL: postgresql://wms:${PGPASSWORD:-wms}@db:5432/wms
+      MCP_PORT: 8001
+    command: ["python", "mcp/http_server.py"]
+
+volumes:
+  pgdata:
