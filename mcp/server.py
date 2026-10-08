@@ -5,11 +5,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import asyncio
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from mcp.types import Tool, TextContent, ImageContent
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://wms:wms@localhost:5432/wms")
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", os.path.join(os.path.dirname(__file__), "..", "uploads"))
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 Session = sessionmaker(bind=engine)
 
@@ -74,6 +75,18 @@ TOOLS = [
     Tool(name="wms_list_zones", description="列出某楼层区域",
          inputSchema={"type": "object", "properties": {
              "floor_id": {"type": "number"}}, "required": ["floor_id"]}),
+    Tool(name="wms_view_image", description="查看某个库位某一层的货物照片（返回图片本体，AI 能直接看见内容，用于确认实物）",
+         inputSchema={"type": "object", "properties": {
+             "floor_id": {"type": "number"},
+             "code": {"type": "string", "description": "如 B-04"},
+             "level_index": {"type": "number", "description": "层序号，从 0 开始"}}, "required": ["floor_id", "code", "level_index"]}),
+    Tool(name="wms_view_images", description="批量查看某楼层的货物照片（缩略图，每张标注所在库位/层/货名）。用户发图问东西在仓库哪里时，用它逐层扫图比对找位置",
+         inputSchema={"type": "object", "properties": {
+             "floor_id": {"type": "number"},
+             "code": {"type": "string", "description": "只看某个库位（可选）"},
+             "keyword": {"type": "string", "description": "按货名关键词过滤（可选）"},
+             "limit": {"type": "number", "description": "这次最多返回几张，默认 6，上限 12"},
+             "offset": {"type": "number", "description": "从第几张开始（翻页用），默认 0"}}, "required": ["floor_id"]}),
 ]
 
 def code_to_rc(code: str):
@@ -98,6 +111,120 @@ def _img_out(p):
     """库里 img_path 转可用地址：外链原样，本地相对路径拼 /uploads/"""
     if not p: return None
     return p if str(p).startswith(("http://", "https://")) else f"/uploads/{p}"
+
+def _img_bytes(img_value):
+    """把 img 地址取回图片字节：本地读 UPLOAD_DIR 下文件，外链用 HTTP 下载。
+    返回 (bytes|None, 错误说明|None)。"""
+    import urllib.request
+    if not img_value:
+        return None, "这一层没有照片"
+    if img_value.startswith("/uploads/"):
+        rel = img_value[len("/uploads/"):].replace("\\", "/")
+        if ".." in rel.split("/") or rel.startswith("/"):
+            return None, "图片路径非法"
+        p = os.path.join(UPLOAD_DIR, rel)
+        if not os.path.isfile(p):
+            return None, f"图片文件不在服务器上（{img_value}）——多半是 mcp 服务没挂载 uploads 目录"
+        with open(p, "rb") as fh:
+            raw = fh.read()
+        return (raw, None) if raw else (None, "图片文件是空的")
+    if img_value.startswith(("http://", "https://")):
+        try:
+            req = urllib.request.Request(img_value, headers={"User-Agent": "wms-mcp/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                raw = resp.read(15 * 1024 * 1024 + 1)
+            if len(raw) > 15 * 1024 * 1024:
+                return None, "外链图片过大（>15MB）"
+            return (raw, None) if raw else (None, "外链图片下载为空")
+        except Exception as e:
+            return None, f"外链图片下载失败：{e}"
+    return None, "不支持的图片引用"
+
+def _sniff_mime(raw):
+    if raw[:8] == b"\x89PNG\r\n\x1a\n": return "image/png"
+    if raw[:2] == b"\xff\xd8": return "image/jpeg"
+    if raw[:6] in (b"GIF87a", b"GIF89a"): return "image/gif"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP": return "image/webp"
+    return "image/jpeg"
+
+def _vision_b64(raw, max_edge):
+    """把照片压成最长边 ≤ max_edge 的 JPEG 再 base64（省 AI 的上下文）。
+    Pillow 处理失败时，原图 ≤3MB 直接回原图。返回 (b64, mime)。"""
+    import base64, io
+    try:
+        from PIL import Image
+        im = Image.open(io.BytesIO(raw)); im.load()
+        im = im.convert("RGB")
+        im.thumbnail((max_edge, max_edge))
+        buf = io.BytesIO(); im.save(buf, "JPEG", quality=80)
+        return base64.b64encode(buf.getvalue()).decode(), "image/jpeg"
+    except Exception:
+        if len(raw) > 3 * 1024 * 1024:
+            raise ValueError("图片过大且压缩失败")
+        return base64.b64encode(raw).decode(), _sniff_mime(raw)
+
+def _slot_code(r, c):
+    return chr(65 + r) + "-" + str(c + 1).zfill(2)
+
+def _image_tool(a, single):
+    """wms_view_image / wms_view_images：返回 文本索引 + ImageContent 列表。"""
+    fid = a["floor_id"]
+    fl = q_one("SELECT id, name FROM floors WHERE id=:fid", {"fid": fid})
+    if not fl: raise ValueError("楼层不存在")
+    fname = fl["name"]
+    if single:
+        rc = code_to_rc(str(a.get("code", "")))
+        if not rc: raise ValueError("库位编码格式错误，应为如 B-04")
+        slot = q_one("SELECT id, r, c FROM slots WHERE floor_id=:fid AND r=:r AND c=:c",
+                     {"fid": fid, "r": rc[0], "c": rc[1]})
+        if not slot: raise ValueError("库位不存在")
+        idx = int(a["level_index"])
+        lv = q_one("SELECT name, qty, status_key, note, img_path FROM levels WHERE slot_id=:sid AND level_index=:idx",
+                   {"sid": slot["id"], "idx": idx})
+        if not lv or not lv["img_path"]: raise ValueError("这一层没有照片")
+        raw, err = _img_bytes(_img_out(lv["img_path"]))
+        if err: raise ValueError(err)
+        b64, mime = _vision_b64(raw, 1024)
+        label = f"{fname} {_slot_code(slot['r'], slot['c'])} 第{idx + 1}层「{lv['name']}」x{lv['qty']}"
+        if lv["note"]: label += f"（备注：{lv['note']}）"
+        return [TextContent(type="text", text=label + " 的照片："),
+                ImageContent(type="image", data=b64, mimeType=mime)]
+
+    limit = min(12, max(1, int(a.get("limit") or 6)))
+    offset = max(0, int(a.get("offset") or 0))
+    where = ["s.floor_id=:fid", "l.img_path IS NOT NULL", "l.img_path <> ''"]
+    params = {"fid": fid}
+    if a.get("code"):
+        rc = code_to_rc(str(a["code"]))
+        if not rc: raise ValueError("库位编码格式错误，应为如 B-04")
+        where.append("s.r=:r AND s.c=:c"); params.update({"r": rc[0], "c": rc[1]})
+    if a.get("keyword"):
+        where.append("l.name LIKE :kw"); params["kw"] = f"%{a['keyword']}%"
+    w = " AND ".join(where)
+    total = q_one(f"""SELECT COUNT(*) AS n FROM levels l JOIN slots s ON s.id=l.slot_id
+                      WHERE {w}""", params)["n"]
+    rows = q(f"""SELECT s.r, s.c, l.level_index, l.name, l.qty, l.note, l.img_path
+                 FROM levels l JOIN slots s ON s.id=l.slot_id
+                 WHERE {w} ORDER BY s.r, s.c, l.level_index LIMIT :lim OFFSET :off""",
+             {**params, "lim": limit, "off": offset})
+    contents, lines, shown = [], [], 0
+    for row in rows:
+        n = offset + shown + 1
+        pos = f"{fname} {_slot_code(row['r'], row['c'])} 第{row['level_index'] + 1}层「{row['name']}」x{row['qty']}"
+        raw, err = _img_bytes(_img_out(row["img_path"]))
+        if err:
+            lines.append(f"图{n} {pos}（读取失败：{err}）")
+            continue
+        b64, mime = _vision_b64(raw, 640)
+        lines.append(f"图{n} {pos}")
+        contents.append(ImageContent(type="image", data=b64, mimeType=mime))
+        shown += 1
+    head = f"{fname} 共 {total} 张货物照片，这次第 {offset + 1}–{offset + len(rows)} 张："
+    if offset + len(rows) < total:
+        head += f"\n（还有 {total - offset - len(rows)} 张没看，换 offset={offset + len(rows)} 继续）"
+    if not total:
+        head = f"{fname} 没有符合条件的货物照片。"
+    return [TextContent(type="text", text=head + ("\n" + "\n".join(lines) if lines else ""))] + contents
 
 @server.list_tools()
 async def list_tools():
@@ -309,6 +436,8 @@ async def call_tool(name: str, arguments: dict):
         elif name == "wms_list_zones":
             result = q("SELECT name, r0, c0, r1, c1 FROM zones WHERE floor_id=:fid ORDER BY id",
                        {"fid": a["floor_id"]})
+        elif name in ("wms_view_image", "wms_view_images"):
+            return _image_tool(a, single=(name == "wms_view_image"))
         else:
             raise ValueError(f"未知工具: {name}")
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2, default=str))]

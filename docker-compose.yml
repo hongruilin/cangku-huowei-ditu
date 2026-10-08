@@ -48,6 +48,9 @@ services:
     environment:
       DATABASE_URL: postgresql://wms:${PGPASSWORD:-wms}@db:5432/wms
       MCP_PORT: 8001
+      UPLOAD_DIR: /app/uploads
+    volumes:
+      - ./uploads:/app/uploads
     command: ["python", "mcp/http_server.py"]
 
 volumes:
