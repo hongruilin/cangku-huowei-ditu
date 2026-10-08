@@ -95,6 +95,7 @@ def _apply_import(db: Session, statuses, floors):
             db.query(models.Level).filter(models.Level.slot_id.in_(old_slot_ids)).delete(synchronize_session=False)
         db.query(models.Slot).filter(models.Slot.floor_id.in_(old_floor_ids)).delete(synchronize_session=False)
         db.query(models.Zone).filter(models.Zone.floor_id.in_(old_floor_ids)).delete(synchronize_session=False)
+        db.query(models.SlotGroup).filter(models.SlotGroup.floor_id.in_(old_floor_ids)).delete(synchronize_session=False)
         db.query(models.Floor).filter(models.Floor.id.in_(old_floor_ids)).delete(synchronize_session=False)
     db.flush()
 
@@ -124,6 +125,7 @@ def _apply_import(db: Session, statuses, floors):
                                    r0=int(z.get("r0", z.get("y1", 0)) or 0), c0=int(z.get("c0", z.get("x1", 0)) or 0),
                                    r1=int(z.get("r1", z.get("y2", 0)) or 0), c1=int(z.get("c1", z.get("x2", 0)) or 0)))
 
+        created_keys = set()
         for key, st in (f.get("slots", {}) or {}).items():
             if not isinstance(st, dict):
                 continue
@@ -144,6 +146,22 @@ def _apply_import(db: Session, statuses, floors):
                                     name=lv.get("name", "") or "", qty=qty,
                                     img_path=_img_path_in(lv.get("img")),
                                     note=str(lv.get("note", "") or "")[:500]))
+            created_keys.add(f"{r},{c}")
+
+        # 库位编组（置物架）：成员只保留本层已建的库位，一个库位只进一个组
+        claimed = set()
+        for gorder, g in enumerate(f.get("groups", []) or []):
+            if not isinstance(g, dict):
+                continue
+            gname = str(g.get("name", "")).strip()[:64]
+            members = []
+            for mk in (g.get("members", []) or []):
+                mk = str(mk)
+                if mk in created_keys and mk not in claimed:
+                    claimed.add(mk); members.append(mk)
+            if gname and members:
+                db.add(models.SlotGroup(floor_id=fl.id, name=gname,
+                                        members=json.dumps(members), sort_order=gorder))
 
 
 def _referenced_local_images(floors):
@@ -179,6 +197,8 @@ def _collect_package(db: Session, wid: int):
     for fl in floors:
         zones = db.query(models.Zone).filter(models.Zone.floor_id == fl.id).order_by(models.Zone.id).all()
         slots = db.query(models.Slot).filter(models.Slot.floor_id == fl.id).all()
+        groups = db.query(models.SlotGroup).filter(models.SlotGroup.floor_id == fl.id) \
+            .order_by(models.SlotGroup.sort_order, models.SlotGroup.id).all()
         sids = [s.id for s in slots]
         lvs = db.query(models.Level).filter(models.Level.slot_id.in_(sids)) \
             .order_by(models.Level.slot_id, models.Level.level_index).all() if sids else []
@@ -203,6 +223,7 @@ def _collect_package(db: Session, wid: int):
             "name": fl.name, "rows": fl.rows, "cols": fl.cols, "pz": 1,
             "zones": [{"name": z.name, "r0": z.r0, "c0": z.c0, "r1": z.r1, "c1": z.c1} for z in zones],
             "slots": {f"{s.r},{s.c}": {"levels": by_slot.get(s.id, [])} for s in slots},
+            "groups": [{"name": g.name, "members": json.loads(g.members or "[]")} for g in groups],
         })
     sts = db.query(models.Status).filter(
         (models.Status.warehouse_id.is_(None)) | (models.Status.warehouse_id == wid)).all()

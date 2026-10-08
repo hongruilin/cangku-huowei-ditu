@@ -10,6 +10,7 @@ router = APIRouter(prefix="/api", tags=["map"])
 
 class MapSave(BaseModel):
     slots: Dict[str, Any]
+    groups: list = None  # 出现 groups 字段时全量替换该楼层编组；不出现则保留原有编组
 
 def _code(r: int, c: int) -> str:
     return chr(65 + r) + "-" + str(c + 1).zfill(2)
@@ -59,11 +60,16 @@ def get_map(fid: int, user: models.User = Depends(require_role("viewer")),
                        for i in range(max_idx + 1)]
         }
     zones = db.query(models.Zone).filter(models.Zone.floor_id == fid).order_by(models.Zone.id).all()
+    import json as _json
+    groups = db.query(models.SlotGroup).filter(models.SlotGroup.floor_id == fid)\
+        .order_by(models.SlotGroup.sort_order, models.SlotGroup.id).all()
     return {
         "floor": {"id": f.id, "name": f.name, "rows": f.rows, "cols": f.cols},
         "slots": out,
         "zones": [{"id": str(z.id), "name": z.name, "r0": z.r0, "c0": z.c0, "r1": z.r1, "c1": z.c1}
                   for z in zones],
+        "groups": [{"id": str(g.id), "name": g.name,
+                    "members": _json.loads(g.members or "[]")} for g in groups],
     }
 
 @router.put("/floors/{fid}/map")
@@ -78,11 +84,13 @@ def save_map(fid: int, data: MapSave, user: models.User = Depends(require_role("
     db.query(models.Slot).filter(models.Slot.floor_id == fid).delete()
     db.flush()
     n_slot = n_level = 0
+    saved_keys = set()
     for key, st in data.slots.items():
         try:
             rr, cc = key.split(","); r, c = int(rr), int(cc)
         except ValueError:
             continue
+        saved_keys.add(f"{r},{c}")
         slot = models.Slot(floor_id=fid, r=r, c=c)
         db.add(slot); db.flush()
         n_slot += 1
@@ -97,9 +105,29 @@ def save_map(fid: int, data: MapSave, user: models.User = Depends(require_role("
                 note=str(lv.get("note", ""))[:500] if isinstance(lv, dict) else "",
             ))
             n_level += 1
+    n_group = 0
+    if data.groups is not None:
+        # 带 groups 字段保存：全量替换该楼层编组；成员须是已保存的库位，一个库位只进一个组
+        import json as _json
+        db.query(models.SlotGroup).filter(models.SlotGroup.floor_id == fid).delete()
+        claimed = set()
+        for order, g in enumerate(data.groups if isinstance(data.groups, list) else []):
+            if not isinstance(g, dict):
+                continue
+            name = str(g.get("name", "")).strip()[:64]
+            members = []
+            for mk in g.get("members", []) if isinstance(g.get("members"), list) else []:
+                mk = str(mk)
+                if mk in saved_keys and mk not in claimed:
+                    claimed.add(mk); members.append(mk)
+            if not name or not members:
+                continue
+            db.add(models.SlotGroup(floor_id=fid, name=name, members=_json.dumps(members),
+                                    sort_order=order))
+            n_group += 1
     db.commit()
-    log_op(db, user.id, "map.save", f"保存楼层{fid}地图：{n_slot}库位/{n_level}层级")
-    return {"ok": True, "slots": n_slot, "levels": n_level}
+    log_op(db, user.id, "map.save", f"保存楼层{fid}地图：{n_slot}库位/{n_level}层级/{n_group}编组")
+    return {"ok": True, "slots": n_slot, "levels": n_level, "groups": n_group}
 
 @router.get("/warehouses/{wid}/export")
 def export_warehouse(wid: int, user: models.User = Depends(require_role("viewer")),
@@ -113,7 +141,7 @@ def export_warehouse(wid: int, user: models.User = Depends(require_role("viewer"
     for fl in floors:
         # 复用 get_map 逻辑
         m = get_map(fl.id, user, db)
-        out_floors.append({"floor": m["floor"], "slots": m["slots"], "zones": m["zones"]})
+        out_floors.append({"floor": m["floor"], "slots": m["slots"], "zones": m["zones"], "groups": m["groups"]})
     sts = db.query(models.Status).filter(
         (models.Status.warehouse_id.is_(None)) | (models.Status.warehouse_id == wid)).all()
     log_op(db, user.id, "warehouse.export", f"导出仓库{wid}数据")

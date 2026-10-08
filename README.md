@@ -1,6 +1,6 @@
 # 仓库货位地图（开源 WMS）
 
-![version](https://img.shields.io/badge/version-v2.4.0-blue) ![license](https://img.shields.io/badge/license-MIT-green)
+![version](https://img.shields.io/badge/version-v2.7.0-blue) ![license](https://img.shields.io/badge/license-MIT-green)
 
 免费开源的仓库管理系统，适合小仓库、电商仓、工厂库房：自己画仓库地图，每个货位按层管理货物，一眼看到每层的名称、数量、状态和照片；手机和电脑都能用，Docker 一条命令部署。
 
@@ -13,6 +13,17 @@
 ---
 
 ## 最新更新
+
+**v2.7.0（2026-10-09）— AI 报位置带组内序号**
+- 位置精确到「第几个库位」：如「1F · 1号货架第2个库位第3层（A-03）」，从左往右、从上往下数
+
+**v2.6.0（2026-10-09）— 问 AI 东西在哪，它说人话位置**
+- 搜索/详情结果带现成位置描述（如「1F · 1号货架第3层（A-03）」），AI 直接念，不再只报冷冰冰的库位编码
+- MCP 服务器新增回答规范 instructions，所有客户端一连接就自动带着
+
+**v2.5.0（2026-10-09）— 库位编组：多个库位组成一个置物架**
+- 工具栏「库位编组」多选库位并命名：地图上有组名标签，货架视图卡片带编组徽章，移动/删除库位时编组自动维护
+- MCP 新增编组管理工具（wms_list/create/update/delete_group，共 18 个工具），AI 可按"XX 架"定位与重组
 
 **v2.4.0（2026-10-09）— MCP 看图：AI 能按图找货**
 - 新增 `wms_view_images`：按楼层批量返回货物照片（带货位索引），AI 扫图比对即可定位实物在哪个货位

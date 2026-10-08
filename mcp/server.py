@@ -14,7 +14,12 @@ UPLOAD_DIR = os.getenv("UPLOAD_DIR", os.path.join(os.path.dirname(__file__), "..
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 Session = sessionmaker(bind=engine)
 
-server = Server("wms-mcp")
+server = Server("wms-mcp", instructions=(
+    "这是一个仓库货位地图（WMS）的 AI 接口，有多楼层，仓库里许多库位（A-01 这样的编号）被组合成具名的置物架（即编组，如「1号货架」），每个库位有多层。\n"
+    "用户问东西在哪时：先用 wms_search_goods 按货物名搜索；搜不到时用 wms_view_images 按楼层逐层看照片比对找物，找到候选再用 wms_view_image 细看确认。\n"
+    "工具结果带 location 字段，已拼成人话位置（如「1F · 1号货架第2个库位第3层（A-03）」，组内库位顺序为先从上往下排、同一行从左往右数」）。回答位置时必须直接引用 location：先说货架名、组内第几个库位和第几层，库位编码只放在括号里作对照；不要只报 A-03 这类编码。只有该库位确实没有编组时，才用「楼层 + 编码」表达。\n"
+    "修改库存、移动库位、改编组等写操作前，先用 wms_get_slot / wms_get_floor_map 核对目标格再执行。"
+))
 
 TOOLS = [
     Tool(name="wms_list_warehouses", description="列出所有仓库",
@@ -87,6 +92,24 @@ TOOLS = [
              "keyword": {"type": "string", "description": "按货名关键词过滤（可选）"},
              "limit": {"type": "number", "description": "这次最多返回几张，默认 6，上限 12"},
              "offset": {"type": "number", "description": "从第几张开始（翻页用），默认 0"}}, "required": ["floor_id"]}),
+    Tool(name="wms_list_groups", description="列出某楼层的库位编组（置物架）：组名和包含的库位",
+         inputSchema={"type": "object", "properties": {
+             "floor_id": {"type": "number"}}, "required": ["floor_id"]}),
+    Tool(name="wms_create_group", description="把多个库位组成一个置物架并命名（如把 A-01..A-04 组成「1号架」）。一个库位只能属于一个编组",
+         inputSchema={"type": "object", "properties": {
+             "floor_id": {"type": "number"},
+             "name": {"type": "string", "description": "编组名称，如 1号架"},
+             "codes": {"type": "array", "items": {"type": "string"}, "description": "库位编码列表，如 [\"A-01\",\"A-02\"]"}}, "required": ["floor_id", "name", "codes"]}),
+    Tool(name="wms_update_group", description="修改编组：改名（name）和/或整体替换成员（codes）",
+         inputSchema={"type": "object", "properties": {
+             "floor_id": {"type": "number"},
+             "group_id": {"type": "number"},
+             "name": {"type": "string"},
+             "codes": {"type": "array", "items": {"type": "string"}}}, "required": ["floor_id", "group_id"]}),
+    Tool(name="wms_delete_group", description="解散编组（只删编组本身，库位和货物不受影响）",
+         inputSchema={"type": "object", "properties": {
+             "floor_id": {"type": "number"},
+             "group_id": {"type": "number"}}, "required": ["floor_id", "group_id"]}),
 ]
 
 def code_to_rc(code: str):
@@ -166,6 +189,82 @@ def _vision_b64(raw, max_edge):
 def _slot_code(r, c):
     return chr(65 + r) + "-" + str(c + 1).zfill(2)
 
+def _groups_of(fid):
+    """楼层编组列表：[{group_id, name, members: ['r,c'...]}]"""
+    import json as _json
+    rows = q("SELECT id, name, members FROM slot_groups WHERE floor_id=:fid ORDER BY sort_order, id",
+             {"fid": fid})
+    out = []
+    for g in rows:
+        try:
+            members = [str(m) for m in _json.loads(g["members"] or "[]")]
+        except Exception:
+            members = []
+        out.append({"group_id": g["id"], "name": g["name"], "members": members})
+    return out
+
+def _group_name_of_key(groups, key):
+    for g in groups:
+        if key in g["members"]:
+            return g["name"]
+    return None
+
+def _group_pos_map(groups):
+    """key → (组名, 组内序号)。序号按阅读顺序：先从上往下排（行），同一行从左往右（列）"""
+    out = {}
+    for g in groups:
+        ms = sorted(g["members"], key=lambda m: tuple(int(v) for v in m.split(",")))
+        for i, m in enumerate(ms):
+            out[m] = (g["name"], i + 1)
+    return out
+
+def _loc(floor_name, group_name, ordinal, code, level_index=None):
+    """把位置拼成人话：组名（置物架）优先，再报组内第几个库位，编码只放括号对照。
+    例：有组 "1F · 1号货架第2个库位第3层（A-03）"；无组 "1F · A-03 第3层"。"""
+    s = (floor_name + " · ") if floor_name else ""
+    if group_name:
+        s += group_name
+        if ordinal:
+            s += f"第{ordinal}个库位"
+        if level_index is not None:
+            s += f"第{level_index + 1}层"
+        s += f"（{code}）"
+    else:
+        s += code
+        if level_index is not None:
+            s += f" 第{level_index + 1}层"
+    return s
+
+def _translate_groups(db, fid, keymap, dropped_keys):
+    """移动/覆盖后同步编组成员（成员跟随库位走，不是跟随位置）：
+    keymap 的旧 key 换新 key；dropped_keys（被覆盖删除的格子）移出组；成员为空的组删除。
+    必须在与移动同一个事务的 db 上执行。"""
+    import json as _json
+    rows = db.execute(text("SELECT id, members FROM slot_groups WHERE floor_id=:fid"),
+                      {"fid": fid}).mappings().all()
+    if not rows:
+        return
+    existing = {f"{s['r']},{s['c']}" for s in
+                db.execute(text("SELECT r, c FROM slots WHERE floor_id=:fid"), {"fid": fid}).mappings().all()}
+    for g in rows:
+        try:
+            members = [str(m) for m in _json.loads(g["members"] or "[]")]
+        except Exception:
+            members = []
+        new = []
+        for m in members:
+            if m in dropped_keys and m not in keymap:
+                continue
+            nm = keymap.get(m, m)
+            if nm in existing and nm not in new:
+                new.append(nm)
+        if new != members:
+            if new:
+                db.execute(text("UPDATE slot_groups SET members=:mem WHERE id=:gid"),
+                           {"mem": _json.dumps(new), "gid": g["id"]})
+            else:
+                db.execute(text("DELETE FROM slot_groups WHERE id=:gid"), {"gid": g["id"]})
+
 def _image_tool(a, single):
     """wms_view_image / wms_view_images：返回 文本索引 + ImageContent 列表。"""
     fid = a["floor_id"]
@@ -185,7 +284,8 @@ def _image_tool(a, single):
         raw, err = _img_bytes(_img_out(lv["img_path"]))
         if err: raise ValueError(err)
         b64, mime = _vision_b64(raw, 1024)
-        label = f"{fname} {_slot_code(slot['r'], slot['c'])} 第{idx + 1}层「{lv['name']}」x{lv['qty']}"
+        gname1, gord1 = _group_pos_map(_groups_of(fid)).get(f"{slot['r']},{slot['c']}", (None, None))
+        label = f"{_loc(fname, gname1, gord1, _slot_code(slot['r'], slot['c']), idx)}「{lv['name']}」x{lv['qty']}"
         if lv["note"]: label += f"（备注：{lv['note']}）"
         return [TextContent(type="text", text=label + " 的照片："),
                 ImageContent(type="image", data=b64, mimeType=mime)]
@@ -208,9 +308,11 @@ def _image_tool(a, single):
                  WHERE {w} ORDER BY s.r, s.c, l.level_index LIMIT :lim OFFSET :off""",
              {**params, "lim": limit, "off": offset})
     contents, lines, shown = [], [], 0
+    pos_map = _group_pos_map(_groups_of(fid))
     for row in rows:
         n = offset + shown + 1
-        pos = f"{fname} {_slot_code(row['r'], row['c'])} 第{row['level_index'] + 1}层「{row['name']}」x{row['qty']}"
+        gnameB, gordB = pos_map.get(f"{row['r']},{row['c']}", (None, None))
+        pos = f"{_loc(fname, gnameB, gordB, _slot_code(row['r'], row['c']), row['level_index'])}「{row['name']}」x{row['qty']}"
         raw, err = _img_bytes(_img_out(row["img_path"]))
         if err:
             lines.append(f"图{n} {pos}（读取失败：{err}）")
@@ -244,32 +346,56 @@ async def call_tool(name: str, arguments: dict):
             fid = a["floor_id"]
             slots = q("SELECT id, r, c FROM slots WHERE floor_id=:fid", {"fid": fid})
             sids = [s["id"] for s in slots]
-            levels = q("SELECT slot_id, level_index, status_key, name, qty, note, img_path FROM levels WHERE slot_id = ANY(:sids) ORDER BY slot_id, level_index",
-                       {"sids": sids}) if sids else []
+            if sids:
+                ph = ",".join(f":s{i}" for i in range(len(sids)))
+                levels = q(f"SELECT slot_id, level_index, status_key, name, qty, note, img_path FROM levels WHERE slot_id IN ({ph}) ORDER BY slot_id, level_index",
+                           {f"s{i}": v for i, v in enumerate(sids)})
+            else:
+                levels = []
             by_slot = {}
             for lv in levels:
                 lv["img"] = _img_out(lv.pop("img_path", None))
                 by_slot.setdefault(lv["slot_id"], []).append(lv)
             out = []
+            groups = _groups_of(fid)
+            pos_map = _group_pos_map(groups)
+            fl_ = q_one("SELECT name FROM floors WHERE id=:fid", {"fid": fid})
+            fname_ = fl_["name"] if fl_ else ""
             for s in slots:
                 code = chr(65 + s["r"]) + "-" + str(s["c"] + 1).zfill(2)
-                out.append({"code": code, "levels": by_slot.get(s["id"], [])})
+                gname_, gord_ = pos_map.get(f"{s['r']},{s['c']}", (None, None))
+                out.append({"code": code, "levels": by_slot.get(s["id"], []),
+                            "group": gname_, "group_index": gord_,
+                            "location": _loc(fname_, gname_, gord_, code)})
             zones = q("SELECT name, r0, c0, r1, c1 FROM zones WHERE floor_id=:fid", {"fid": fid})
-            result = {"slots": out, "zones": zones}
+            result = {"slots": out, "zones": zones,
+                      "groups": [{"group_id": g["group_id"], "name": g["name"],
+                                  "members": [_slot_code(*[int(v) for v in m.split(",")]) for m in g["members"]]}
+                                 for g in groups]}
         elif name == "wms_search_goods":
-            sql = """SELECT w.name AS warehouse, f.name AS floor,
-                            CHR(65+s.r) || '-' || LPAD((s.c+1)::text,2,'0') AS code,
+            sql = """SELECT w.name AS warehouse, f.name AS floor, f.id AS floor_id, s.r, s.c,
                             l.level_index, l.status_key, l.name, l.qty, l.note, l.img_path
                      FROM levels l JOIN slots s ON s.id=l.slot_id
                      JOIN floors f ON f.id=s.floor_id JOIN warehouses w ON w.id=f.warehouse_id
-                     WHERE l.name ILIKE :kw"""
-            params = {"kw": f"%{a['keyword']}%"}
+                     WHERE lower(l.name) LIKE :kw"""
+            params = {"kw": f"%{str(a['keyword']).lower()}%"}
             if a.get("warehouse_id"):
                 sql += " AND w.id=:wid"; params["wid"] = a["warehouse_id"]
             sql += " ORDER BY w.id,f.id,s.r,s.c,l.level_index LIMIT 100"
             result = q(sql, params)
+            gcache = {}
             for row in result:
                 row["img"] = _img_out(row.pop("img_path", None))
+                code_ = _slot_code(row["r"], row["c"])
+                row["code"] = code_
+                fid_ = row.get("floor_id")
+                if fid_ not in gcache:
+                    gcache[fid_] = _group_pos_map(_groups_of(fid_))
+                gname, gord = gcache[fid_].get(f"{row['r']},{row['c']}", (None, None))
+                row["group"] = gname
+                row["group_index"] = gord
+                row["location"] = _loc(row.get("floor"), gname, gord, code_, row.get("level_index"))
+                row.pop("floor_id", None); row.pop("r", None); row.pop("c", None)
         elif name == "wms_get_slot":
             rc = code_to_rc(a["code"])
             if not rc: raise ValueError("库位编码格式错误，应为如 B-04")
@@ -280,9 +406,17 @@ async def call_tool(name: str, arguments: dict):
             else:
                 levels = q("SELECT level_index, status_key, name, qty, note, img_path FROM levels WHERE slot_id=:sid ORDER BY level_index",
                            {"sid": s["id"]})
+                fl_ = q_one("SELECT name FROM floors WHERE id=:fid", {"fid": a["floor_id"]})
+                fname_ = fl_["name"] if fl_ else ""
+                groups = _groups_of(a["floor_id"])
+                key = f"{rc[0]},{rc[1]}"
+                gname, gord = _group_pos_map(groups).get(key, (None, None))
                 for lv in levels:
                     lv["img"] = _img_out(lv.pop("img_path", None))
-                result = {"code": a["code"], "exists": True, "levels": levels}
+                    lv["location"] = _loc(fname_, gname, gord, a["code"], lv.get("level_index"))
+                result = {"code": a["code"], "exists": True, "levels": levels, "group": gname,
+                          "group_index": gord,
+                          "location": _loc(fname_, gname, gord, a["code"])}
         elif name == "wms_update_level":
             rc = code_to_rc(a["code"])
             if not rc: raise ValueError("库位编码格式错误")
@@ -354,6 +488,9 @@ async def call_tool(name: str, arguments: dict):
                                       {"sid": nsid}).mappings().first()["n"]
                 db.execute(text("INSERT INTO op_logs (action, detail) VALUES (:act, :d)"),
                            {"act": f"mcp.{name}", "d": f"{a['from_code']} -> {a['to_code']}"})
+                _translate_groups(db, a["floor_id"],
+                                  {f"{frc[0]},{frc[1]}": f"{trc[0]},{trc[1]}"} if name == "wms_move_slot" else {},
+                                  {f"{trc[0]},{trc[1]}"} if overwritten else set())
                 db.commit()
                 result = {"ok": True, "from": a["from_code"], "to": a["to_code"],
                           "levels": n_levels, "overwritten": overwritten}
@@ -421,10 +558,108 @@ async def call_tool(name: str, arguments: dict):
                                         "qty": lv["qty"], "img": lv["img_path"], "note": lv["note"]})
                 db.execute(text("INSERT INTO op_logs (action, detail) VALUES (:act, :d)"),
                            {"act": f"mcp.{name}", "d": f"批量{len(pairs)}个: " + ", ".join(f"{p[0]}->{p[1]}" for p in pairs)})
+                if name == "wms_move_slots":
+                    keymap = {f"{p[2][0]},{p[2][1]}": f"{p[3][0]},{p[3][1]}" for p in pairs}
+                    dropped = {f"{p[3][0]},{p[3][1]}" for p in pairs if p[1] in overwritten}
+                    _translate_groups(db, fid, keymap, dropped)
+                elif overwritten:
+                    dropped = {f"{p[3][0]},{p[3][1]}" for p in pairs if p[1] in overwritten}
+                    _translate_groups(db, fid, {}, dropped)
                 db.commit()
                 result = {"ok": True, "count": len(pairs), "overwritten": overwritten}
             finally:
                 db.close()
+        elif name == "wms_list_groups":
+            fid = a["floor_id"]
+            if not q_one("SELECT id FROM floors WHERE id=:fid", {"fid": fid}):
+                raise ValueError("楼层不存在")
+            gs = _groups_of(fid)
+            slots_by_key = {f"{s['r']},{s['c']}": s for s in q("SELECT r, c FROM slots WHERE floor_id=:fid", {"fid": fid})}
+            result = [{"group_id": g["group_id"], "name": g["name"],
+                       "members": [_slot_code(*[int(v) for v in m.split(",")]) for m in g["members"] if m in slots_by_key],
+                       "count": len(g["members"])} for g in gs]
+        elif name == "wms_create_group":
+            fid = a["floor_id"]
+            name_g = str(a.get("name", "")).strip()
+            if not name_g: raise ValueError("编组名称不能为空")
+            if not q_one("SELECT id FROM floors WHERE id=:fid", {"fid": fid}):
+                raise ValueError("楼层不存在")
+            keys, seen = [], set()
+            for cd in a.get("codes") or []:
+                rc = code_to_rc(str(cd))
+                if not rc: raise ValueError(f"库位编码格式错误：{cd}")
+                k = f"{rc[0]},{rc[1]}"
+                if k not in seen: seen.add(k); keys.append(k)
+            if not keys: raise ValueError("至少要选一个库位")
+            slots_by_key = {f"{s['r']},{s['c']}": s for s in q("SELECT r, c FROM slots WHERE floor_id=:fid", {"fid": fid})}
+            missing = [k for k in keys if k not in slots_by_key]
+            if missing: raise ValueError("这些库位不存在：" + ", ".join(_slot_code(*[int(v) for v in k.split(",")]) for k in missing))
+            existing = _groups_of(fid)
+            for k in keys:
+                gname = _group_name_of_key(existing, k)
+                if gname: raise ValueError(f"{_slot_code(*[int(v) for v in k.split(',')])} 已在编组「{gname}」中，一个库位只能属于一个编组")
+            db = Session()
+            try:
+                so = db.execute(text("SELECT COALESCE(MAX(sort_order), -1) AS m FROM slot_groups WHERE floor_id=:fid"),
+                                {"fid": fid}).mappings().first()["m"] + 1
+                gid = db.execute(text("INSERT INTO slot_groups (floor_id, name, members, sort_order) VALUES (:fid,:nm,:mem,:so) RETURNING id"),
+                                 {"fid": fid, "nm": name_g[:64], "mem": json.dumps(keys), "so": so}).mappings().first()["id"]
+                db.commit()
+            finally:
+                db.close()
+            result = {"ok": True, "group_id": gid, "name": name_g[:64],
+                      "members": [_slot_code(*[int(v) for v in k.split(",")]) for k in keys]}
+        elif name == "wms_update_group":
+            fid, gid = a["floor_id"], int(a["group_id"])
+            g = q_one("SELECT id, name, members FROM slot_groups WHERE id=:gid AND floor_id=:fid",
+                      {"gid": gid, "fid": fid})
+            if not g: raise ValueError("编组不存在")
+            new_name, new_members = None, None
+            if a.get("name") is not None:
+                new_name = str(a["name"]).strip()
+                if not new_name: raise ValueError("编组名称不能为空")
+                new_name = new_name[:64]
+            if a.get("codes") is not None:
+                keys, seen = [], set()
+                for cd in a["codes"] or []:
+                    rc = code_to_rc(str(cd))
+                    if not rc: raise ValueError(f"库位编码格式错误：{cd}")
+                    k = f"{rc[0]},{rc[1]}"
+                    if k not in seen: seen.add(k); keys.append(k)
+                slots_by_key = {f"{s['r']},{s['c']}": s for s in q("SELECT r, c FROM slots WHERE floor_id=:fid", {"fid": fid})}
+                missing = [k for k in keys if k not in slots_by_key]
+                if missing: raise ValueError("这些库位不存在：" + ", ".join(_slot_code(*[int(v) for v in k.split(",")]) for k in missing))
+                for k in keys:
+                    for x in _groups_of(fid):
+                        if x["group_id"] != gid and k in x["members"]:
+                            raise ValueError(f"{_slot_code(*[int(v) for v in k.split(',')])} 已在编组「{x['name']}」中")
+                new_members = keys
+            if new_name is None and new_members is None:
+                raise ValueError("没有要更新的字段（name 或 codes）")
+            db = Session()
+            try:
+                sets, params = [], {"gid": gid}
+                if new_name is not None: sets.append("name=:nm"); params["nm"] = new_name
+                if new_members is not None: sets.append("members=:mem"); params["mem"] = json.dumps(new_members)
+                db.execute(text(f"UPDATE slot_groups SET {', '.join(sets)} WHERE id=:gid"), params)
+                db.commit()
+            finally:
+                db.close()
+            result = {"ok": True, "group_id": gid, "name": new_name if new_name is not None else g["name"],
+                      "members": ([_slot_code(*[int(v) for v in m.split(",")]) for m in new_members]
+                                  if new_members is not None else None)}
+        elif name == "wms_delete_group":
+            fid, gid = a["floor_id"], int(a["group_id"])
+            g = q_one("SELECT id, name FROM slot_groups WHERE id=:gid AND floor_id=:fid",
+                      {"gid": gid, "fid": fid})
+            if not g: raise ValueError("编组不存在")
+            db = Session()
+            try:
+                db.execute(text("DELETE FROM slot_groups WHERE id=:gid"), {"gid": gid})
+                db.commit()
+            finally:
+                db.close()
+            result = {"ok": True, "deleted": g["name"]}
         elif name == "wms_inventory_summary":
             sql = """SELECT l.status_key, COUNT(*) AS levels, COALESCE(SUM(l.qty),0) AS qty
                      FROM levels l JOIN slots s ON s.id=l.slot_id JOIN floors f ON f.id=s.floor_id"""

@@ -63,6 +63,15 @@ class Level(Base):
     note = Column(Text, default="")  # 每层可选备注
     __table_args__ = (UniqueConstraint("slot_id", "level_index", name="uq_level_slot_idx"),)
 
+class SlotGroup(Base):
+    """库位编组：把多个库位组合成一个置物架并命名。members 是 JSON 数组 ["r,c", ...]"""
+    __tablename__ = "slot_groups"
+    id = Column(Integer, primary_key=True)
+    floor_id = Column(Integer, ForeignKey("floors.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String(64), nullable=False)
+    members = Column(Text, default="[]")
+    sort_order = Column(Integer, default=0)
+
 class OpLog(Base):
     __tablename__ = "op_logs"
     id = Column(Integer, primary_key=True)
