@@ -143,6 +143,8 @@
   .sheet-grab { cursor: grab; }
   .sheet-head { cursor: grab; }
   .cell.batch-sel { outline: 3px solid #f59e0b !important; outline-offset: -3px; box-shadow: inset 0 0 0 2px #fff; }
+  .cell.in-group { box-shadow: inset 0 0 0 2px #0ea5e9; }
+  .group-tag { position: absolute; z-index: 8; transform: translateY(-100%); background: #0284c7; color: #fff; font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 6px 6px 6px 0; cursor: pointer; white-space: nowrap; box-shadow: 0 1px 4px rgba(2,132,199,.4); }
   /* 编辑窗口停靠位置（拖把手松手后贴边） */
   .sheet-overlay[data-dock="top"] { align-items: flex-start; }
   .sheet-overlay[data-dock="top"] .sheet { border-radius: 0 0 16px 16px; }
@@ -244,7 +246,7 @@
   </div>
 </div>
 <header>
-  <h1>仓库地图 <span style="font-size:12px;color:#94a3b8" id="verTag">v2.4.0</span></h1>
+  <h1>仓库地图 <span style="font-size:12px;color:#94a3b8" id="verTag">v2.7.0</span></h1>
   <div class="stats" id="stats"></div>
   <div style="margin-left:auto;display:flex;align-items:center;gap:8px;">
     <span id="userLabel" style="font-size:12px;color:#64748b;"></span>
@@ -274,6 +276,7 @@
       <button class="btn" id="view3dBtn" style="margin-left:8px">货架视图</button>
       <button class="btn" id="batchMoveBtn" style="margin-left:8px">批量移动</button>
       <button class="btn" id="batchCopyBtn">批量复制</button>
+      <button class="btn" id="groupBtn" title="把多个库位组成一个置物架">库位编组</button>
       <label>绘制状态
         <select id="paintStatus">
           <option value="full">有货</option>
@@ -367,7 +370,7 @@
     <input type="file" id="sheetFile" accept="image/*" hidden>
   </div>
 </div>
-<div id="slotOpBar" hidden><span id="slotOpText"></span><button class="btn sm" id="slotOpPrimary">下一步</button><button class="btn sm" id="slotOpCancel">取消</button></div>
+<div id="slotOpBar" hidden><span id="slotOpText"></span><button class="btn sm" id="slotOpPrimary">下一步</button><button class="btn sm danger" id="slotOpDanger" hidden>解散编组</button><button class="btn sm" id="slotOpCancel">取消</button></div>
 <div class="sheet-overlay" id="statusOverlay" hidden>
   <div class="sheet">
     <div class="sheet-grab"></div>
@@ -452,7 +455,8 @@ async function bootFromServer() {
     API.floorIdMap[i] = f.id;
     const map = await API.get(`/api/floors/${f.id}/map`);
     stateFloors.push({ name: f.name, rows: f.rows, cols: f.cols, slots: map.slots || {},
-      zones: (map.zones || []).map(z => ({ id: z.id, name: z.name, r0: z.r0, c0: z.c0, r1: z.r1, c1: z.c1 })) });
+      zones: (map.zones || []).map(z => ({ id: z.id, name: z.name, r0: z.r0, c0: z.c0, r1: z.r1, c1: z.c1 })),
+      groups: (map.groups || []).map(g => ({ id: String(g.id), name: g.name, members: g.members })) });
   }
   state = { version: DATA_VERSION, floors: stateFloors, active: 0, zoom: 1,
     statuses: stData.statuses.map(s => ({ id: s.key, name: s.name, color: s.color, builtin: !!s.builtin })),
@@ -479,7 +483,7 @@ function syncToServer() {
       const idx = state.active;
       const fid = API.floorIdMap[idx];
       if (!fid) return;
-      await API.put(`/api/floors/${fid}/map`, { slots: state.floors[idx].slots });
+      await API.put(`/api/floors/${fid}/map`, { slots: state.floors[idx].slots, groups: state.floors[idx].groups || [] });
     } catch (e) { console.warn('[sync]', e.message); }
   }, 1500);
 }
@@ -586,6 +590,16 @@ function normalizeState() {
       const c1 = Math.max(c0, Math.floor(Number(hasNewCoords ? z.c1 : z.c2) || c0));
       return { ...z, id: String(z.id || ('z' + (i + 1))), name: String(z.name || ('区域' + (i + 1))).slice(0, 12), r0, c0, r1, c1 };
     });
+    if (!Array.isArray(fl.groups)) fl.groups = [];
+    // 编组规范化：成员只保留存在的库位，一个库位只进一个组（前组优先），空组丢弃
+    const claimedG = new Set();
+    fl.groups = fl.groups.map((g, i) => {
+      g = g && typeof g === 'object' ? g : {};
+      const members = [...new Set((Array.isArray(g.members) ? g.members : []).map(String)
+        .filter(k => fl.slots[k] && !claimedG.has(k)))];
+      members.forEach(k => claimedG.add(k));
+      return { id: String(g.id || ('g' + (i + 1))), name: String(g.name || '未命名架').slice(0, 24), members };
+    }).filter(g => g.members.length);
     Object.keys(fl.slots).forEach(k => { fl.slots[k] = normSlot(fl.slots[k]); });
   });
   state.active = Math.max(0, Math.min(state.floors.length - 1, +state.active || 0));
@@ -816,7 +830,9 @@ function renderGrid() {
       const st = f.slots[key];
       if (isShelf && shelfFilter === 'occupied' && !st) continue;
       const d = document.createElement('div');
-      d.className = 'cell' + (isShelf && !st ? ' shelf-empty' : '') + (batchOp && batchOp.selected.has(key) ? ' batch-sel' : '');
+      const inGrp = !!groupOfKey(f, key);
+      const isSel = (batchOp && batchOp.selected.has(key)) || (groupOp && groupOp.selected.has(key));
+      d.className = 'cell' + (isShelf && !st ? ' shelf-empty' : '') + (inGrp ? ' in-group' : '') + (isSel ? ' batch-sel' : '');
       d.dataset.r = r; d.dataset.c = c;
       d.dataset.code = code(r, c);
       if (st) {
@@ -850,7 +866,9 @@ function renderGrid() {
           const primary = st.levels.find(L => L.name || L.qty > 0 || L.img) || st.levels[0];
           const badgeText = filled ? `${filled}/${st.levels.length}层` : '已建位';
           const badgeColor = primary ? (statusOf(primary.s).color || '#e2e8f0') : '#e2e8f0';
-          d.innerHTML = `<div class="shelf-code"><span>${codeStr}</span><span class="shelf-pos">第${r + 1}行 · 第${c + 1}列</span><span class="shelf-badge" style="background:${badgeColor}">${badgeText}</span></div><div class="bands">${bands}</div>`;
+          const grpObj = groupOfKey(f, key);
+          const gBadge = grpObj ? `<span class="shelf-badge" style="background:#e0f2fe;color:#0369a1">${esc(grpObj.name)}</span>` : '';
+          d.innerHTML = `<div class="shelf-code"><span>${codeStr}</span><span class="shelf-pos">第${r + 1}行 · 第${c + 1}列</span>${gBadge}<span class="shelf-badge" style="background:${badgeColor}">${badgeText}</span></div><div class="bands">${bands}</div>`;
         } else {
           d.innerHTML = `<div class="bands">${bands}</div>` + (tq > 0 ? `<span class="cqty">×${tq}</span>` : '');
           // 小格子放不下全名时，中央显示首个有货层级的首字，一眼知道这是什么货
@@ -873,6 +891,7 @@ function renderGrid() {
     }
   }
   renderZones();
+  renderGroups();
   gridEl.oncontextmenu = e => e.preventDefault();
   syncTouchAction();
 }
@@ -960,7 +979,7 @@ gridEl.addEventListener('pointerdown', e => {
   if (e.pointerType !== 'mouse') { try { d.releasePointerCapture(e.pointerId); } catch (_) {} }
   downPos = { x: e.clientX, y: e.clientY };
   downCell = d;
-  if (batchOp) return; // 正在批量移动/复制：不绘制、不开窗
+  if (batchOp || groupOp) return; // 正在批量移动/复制或编组：不绘制、不开窗
   if (mode === 'view' || mode === 'pan') return; // 查看：pointerup 判点按；平移：浏览器原生滚动
   if (mode === 'paint') {
     const key = d.dataset.r + ',' + d.dataset.c;
@@ -1017,6 +1036,7 @@ gridEl.addEventListener('pointerup', e => {
   }
   if (downCell && downPos && Math.hypot(e.clientX - downPos.x, e.clientY - downPos.y) < 12) {
     if (batchOp) onBatchTap(downCell.dataset.r + ',' + downCell.dataset.c);
+    else if (groupOp) onGroupTap(downCell.dataset.r + ',' + downCell.dataset.c);
     else if (mode === 'view' || pendingSheet) openSheet(downCell);
   }
   painting = false; pendingSheet = false; downPos = null; downCell = null;
@@ -1160,7 +1180,7 @@ function planBatchOp(slotsObj, keys, type, tR, tC, rows, cols) {
 }
 
 function updateBatchBar() {
-  if (!batchOp) { slotOpBar.hidden = true; return; }
+  if (!batchOp) { slotOpBar.hidden = true; slotOpDanger.hidden = true; return; }
   slotOpBar.hidden = false;
   const n = batchOp.selected.size;
   const label = batchOp.type === 'move' ? '移动' : '复制';
@@ -1183,12 +1203,14 @@ function exitBatch(renderAfter = true) {
 }
 function startBatchOp(type) {
   if (sheetKey) closeSheet();
+  if (groupOp) exitGroup(false);
   if (zoneDrawing) { zoneDrawing = false; zoneAnchor = zoneRect = null; clearZoneRect(); const zb = document.getElementById('zoneBtn'); if (zb) zb.classList.remove('active'); }
   batchOp = { type, phase: 'select', selected: new Set() };
   updateBatchBar(); render();
   toast('点选要' + (type === 'move' ? '移动' : '复制') + '的库位，可多选');
 }
 slotOpPrimary.onclick = () => {
+  if (groupOp) { finishGroupOp(); return; }
   if (!batchOp) return;
   if (batchOp.phase === 'select') {
     if (!batchOp.selected.size) { toast('还没选库位'); return; }
@@ -1196,7 +1218,10 @@ slotOpPrimary.onclick = () => {
   } else batchOp.phase = 'select';
   updateBatchBar();
 };
-document.getElementById('slotOpCancel').onclick = () => { exitBatch(); toast('已取消'); };
+document.getElementById('slotOpCancel').onclick = () => {
+  if (groupOp) { exitGroup(); toast('已取消'); return; }
+  exitBatch(); toast('已取消');
+};
 document.getElementById('batchMoveBtn').onclick = () => startBatchOp('move');
 document.getElementById('batchCopyBtn').onclick = () => startBatchOp('copy');
 
@@ -1222,9 +1247,106 @@ async function execBatch(tR, tC) {
   const n = batchOp.selected.size, type = batchOp.type;
   plan.deletes.forEach(k => delete f.slots[k]);
   Object.entries(plan.updates).forEach(([k, v]) => { f.slots[k] = v; });
+  if (type === 'move') translateGroupMembers(f, batchOp.selected, tR, tC);
+  // 被覆盖掉的目标格旧库位已销毁：其编组关系随旧库位一起消失
+  const destroyedG = plan.deletes.filter(k => !(type === 'move' && batchOp.selected.has(k)));
+  if (destroyedG.length) (f.groups || []).forEach(g => { g.members = g.members.filter(k => !destroyedG.includes(k)); });
+  pruneGroups(f);
   exitBatch(false); render();
   toast((type === 'move' ? '已移动 ' : '已复制 ') + n + ' 个库位');
 }
+
+/* ===== 库位编组：多个库位组成一个置物架 ===== */
+function groupOfKey(fl, key) {
+  return (fl.groups || []).find(g => g.members.includes(key)) || null;
+}
+function pruneGroups(fl) {
+  (fl.groups || []).forEach(g => { g.members = g.members.filter(k => fl.slots[k]); });
+  fl.groups = (fl.groups || []).filter(g => g.members.length);
+}
+function translateGroupMembers(fl, selectedKeys, tR, tC) {
+  const pts = [...selectedKeys].map(k => k.split(',').map(Number));
+  if (!pts.length) return;
+  const dr = tR - Math.min(...pts.map(p => p[0])), dc = tC - Math.min(...pts.map(p => p[1]));
+  const map = {};
+  pts.forEach(([r, c]) => { map[r + ',' + c] = (r + dr) + ',' + (c + dc); });
+  (fl.groups || []).forEach(g => {
+    g.members = [...new Set(g.members.map(k => map[k] || k))].filter(k => fl.slots[k]);
+  });
+}
+
+let groupOp = null; // { editId: string|null, selected: Set<key> }
+const slotOpDanger = document.getElementById('slotOpDanger');
+function updateGroupBar() {
+  if (!groupOp) { slotOpBar.hidden = true; slotOpDanger.hidden = true; return; }
+  slotOpBar.hidden = false;
+  slotOpDanger.hidden = !groupOp.editId;
+  const n = groupOp.selected.size;
+  slotOpText.textContent = (groupOp.editId ? '编辑编组：点格子增减成员' : '新建编组：点选同一置物架的库位') + '（已选 ' + n + ' 个）';
+  slotOpPrimary.textContent = groupOp.editId ? '保存（含改名）' : '下一步：命名';
+  slotOpPrimary.disabled = n === 0;
+  slotOpPrimary.style.opacity = n === 0 ? '.5' : '';
+}
+function exitGroup(renderAfter = true) {
+  groupOp = null; slotOpDanger.hidden = true;
+  slotOpBar.hidden = true;
+  if (renderAfter) render();
+}
+function startGroupOp(existing) {
+  if (sheetKey) closeSheet();
+  if (batchOp) exitBatch(false);
+  if (zoneDrawing) { zoneDrawing = false; zoneAnchor = zoneRect = null; clearZoneRect(); const zb = document.getElementById('zoneBtn'); if (zb) zb.classList.remove('active'); }
+  if (document.body.classList.contains('mode3d')) document.getElementById('view3dBtn').click();
+  groupOp = { editId: existing ? existing.id : null, selected: new Set(existing ? existing.members : []) };
+  updateGroupBar(); render();
+  toast(existing ? '编辑编组「' + existing.name + '」' : '点选要组成一个置物架的库位，可多选');
+}
+document.getElementById('groupBtn').onclick = () => startGroupOp(null);
+function onGroupTap(key) {
+  if (!groupOp) return;
+  const fl = floor();
+  if (!fl.slots[key]) { toast('只能选已有库位的格子'); return; }
+  const g = groupOfKey(fl, key);
+  if (g && g.id !== groupOp.editId) { toast('已在编组「' + g.name + '」里，先在那边移出'); return; }
+  groupOp.selected.has(key) ? groupOp.selected.delete(key) : groupOp.selected.add(key);
+  render(); updateGroupBar();
+}
+async function finishGroupOp() {
+  const fl = floor();
+  const members = [...groupOp.selected];
+  if (!members.length) { toast('还没选库位'); return; }
+  if (groupOp.editId) {
+    const g = fl.groups.find(x => x.id === groupOp.editId);
+    if (!g) { exitGroup(); return; }
+    const name = await uiPrompt('编组名称', g.name);
+    if (name === null) return;
+    if (!String(name).trim()) { toast('名字不能为空'); return; }
+    g.name = String(name).trim().slice(0, 24);
+    g.members = members;
+    pruneGroups(fl);
+    exitGroup(false); render();
+    toast('编组已保存');
+  } else {
+    const name = await uiPrompt('给这个置物架起个名字', '置物架' + ((fl.groups || []).length + 1));
+    if (name === null) return;
+    if (!String(name).trim()) { toast('名字不能为空'); return; }
+    fl.groups = fl.groups || [];
+    fl.groups.push({ id: 'g' + Date.now().toString(36), name: String(name).trim().slice(0, 24), members });
+    pruneGroups(fl);
+    exitGroup(false); render();
+    toast('已建编组「' + String(name).trim() + '」');
+  }
+}
+slotOpDanger.onclick = async () => {
+  if (!groupOp || !groupOp.editId) return;
+  const g = floor().groups.find(x => x.id === groupOp.editId);
+  if (!g) { exitGroup(); return; }
+  const ok = await uiConfirm('解散编组', '解散编组「' + g.name + '」吗？库位和货物不受影响。');
+  if (!ok) return;
+  floor().groups = floor().groups.filter(x => x.id !== groupOp.editId);
+  exitGroup(false); render();
+  toast('编组已解散');
+};
 
 /* ===== 编辑窗口拖动停靠：拖把手/标题栏移动，松手贴最近的边 ===== */
 const SHEET_DOCKS = ['bottom', 'top', 'left', 'right'];
@@ -1277,8 +1399,7 @@ function syncSheet() {
   sheetLevel = Math.max(0, Math.min(sheetLevel, st.levels.length - 1));
   const L = st.levels[sheetLevel];
   const [r, c] = sheetKey.split(',').map(Number);
-  sheetCode.textContent = '库位 ' + code(r, c);
-  lvlCount.textContent = st.levels.length + '层';
+  sheetCode.textContent = '库位 ' + code(r, c) + (groupOfKey(floor(), sheetKey) ? ' · ' + groupOfKey(floor(), sheetKey).name : '');  lvlCount.textContent = st.levels.length + '层';
   lvlTabs.innerHTML = '';
   st.levels.forEach((lv, i) => {
     const b = document.createElement('button');
@@ -1339,7 +1460,7 @@ document.getElementById('sheetDelSlot').onclick = async () => {
   if (!sheetSlot()) return;
   if (!(await uiConfirm('删除库位', '删除该库位及全部层级货物信息吗？'))) return;
   floor().slots[sheetKey].levels.forEach(L => deleteImageRef(L.img));
-  delete floor().slots[sheetKey]; closeSheet(); render();
+  delete floor().slots[sheetKey]; pruneGroups(floor()); closeSheet(); render();
 };
 sheetFile.addEventListener('change', () => {
   const file = sheetFile.files[0]; sheetFile.value = '';
@@ -1411,7 +1532,7 @@ function applyCell(d) {
   const cur = f.slots[key];
   if (mode === 'erase' || !paintValue) {
     if (!cur) return;
-    delete f.slots[key];
+    delete f.slots[key]; pruneGroups(f);
   } else {
     const v = document.getElementById('paintStatus').value;
     if (cur) {
@@ -1483,7 +1604,7 @@ function renderList() {
     const parts = st.levels.map((L, i) => (L.name || L.qty > 0 || L.img) ? `层${i + 1} ${esc(L.name) || '未命名'}${L.qty > 0 ? ' ×' + L.qty : ''}` : null).filter(Boolean);
     const badgeText = used ? '有货' : '空位';
     row.innerHTML = `${thumb}<div class="slot-row-main"><div class="slot-row-head"><span class="slot-row-code">${code(r, c)}</span><span class="slot-badge" style="background:${badgeColor};color:${textOn(badgeColor)}">${badgeText}</span></div><div class="slot-row-meta">${st.levels.length}层 · ${statuses}${qty > 0 ? ' · ×' + qty : ''}</div><div class="lvl-meta">${parts.length ? parts.join(' · ') : '（暂无货物）'}</div></div><button class="del" title="删除库位" aria-label="删除库位">×</button>`;
-    row.querySelector('.del').onclick = e => { e.stopPropagation(); delete f.slots[k]; render(); };
+    row.querySelector('.del').onclick = e => { e.stopPropagation(); delete f.slots[k]; pruneGroups(f); render(); };
     row.onclick = () => {
       const cell = gridEl.querySelector(`[data-r="${r}"][data-c="${c}"]`);
       focusCellInMap(cell);
@@ -1609,6 +1730,30 @@ function renderZones() {
     gridEl.appendChild(box);
   });
 }
+function renderGroups() {
+  // 编组标签：挂在组成员最左上那个格子上方；货架视图下不画（卡片徽章代替）
+  document.querySelectorAll('.group-tag').forEach(el => el.remove());
+  if (document.body.classList.contains('mode3d')) return;
+  const fl = floor();
+  (fl.groups || []).forEach(g => {
+    const keys = g.members.filter(k => fl.slots[k]).sort((a, b) => {
+      const [ra, ca] = a.split(',').map(Number), [rb, cb] = b.split(',').map(Number);
+      return ra - rb || ca - cb;
+    });
+    if (!keys.length) return;
+    const [r, c] = keys[0].split(',').map(Number);
+    const cell = gridEl.querySelector(`[data-r="${r}"][data-c="${c}"]`);
+    if (!cell) return;
+    const tag = document.createElement('div');
+    tag.className = 'group-tag';
+    tag.textContent = '▦ ' + g.name + ' · ' + keys.length;
+    tag.style.left = cell.offsetLeft + 'px';
+    tag.style.top = cell.offsetTop + 'px';
+    tag.title = '点击编辑编组「' + g.name + '」';
+    tag.onclick = e => { e.stopPropagation(); startGroupOp(g); };
+    gridEl.appendChild(tag);
+  });
+}
 function renderZoneBar() {
   const bar = document.getElementById('zoneBar');
   const zones = floor().zones;
@@ -1662,6 +1807,7 @@ function jumpToZone(z) {
 }
 document.getElementById('zoneBtn').onclick = () => {
   if (!zoneDrawing && batchOp) exitBatch(true); // 开区域框选前先退出批量模式
+  if (!zoneDrawing && groupOp) exitGroup(true);
   zoneDrawing = !zoneDrawing;
   document.getElementById('zoneBtn').classList.toggle('active', zoneDrawing);
   zoneAnchor = zoneRect = null;
@@ -1673,6 +1819,7 @@ document.getElementById('zoneBtn').onclick = () => {
 document.getElementById('modeSeg').addEventListener('click', e => {
   const b = e.target.closest('button'); if (!b) return;
   if (batchOp) exitBatch(true);
+  if (groupOp) exitGroup(true);
   mode = b.dataset.mode;
   document.querySelectorAll('#modeSeg button').forEach(x => x.classList.toggle('active', x === b));
   syncTouchAction();
@@ -1745,6 +1892,7 @@ document.getElementById('applySize').onclick = () => {
     if (r >= rows || c >= cols) delete f.slots[k];
   });
   f.rows = rows; f.cols = cols;
+  pruneGroups(f);
   f.zones = f.zones.filter(z => z.r0 < rows && z.c0 < cols).map(z => ({ ...z, r1: Math.min(z.r1, rows - 1), c1: Math.min(z.c1, cols - 1) }));
   const fid = API.floorIdMap[state.active];
   if (API.online && fid) API.put(`/api/floors/${fid}`, { rows, cols }).catch(err => console.warn('[resizeFloor]', err.message));
@@ -1754,7 +1902,7 @@ document.getElementById('undoBtn').onclick = undoLast;
 document.getElementById('restoreBtn').onclick = restoreBackup;
 document.getElementById('clearBtn').onclick = async () => {
   if (!(await uiConfirm('清空本层', '清空楼层「' + floor().name + '」的全部库位吗？'))) return;
-  floor().slots = {}; render();
+  floor().slots = {}; pruneGroups(floor()); render();
 };
 document.getElementById('exportBtn').onclick = () => {
   if (API.online && API.warehouseId) {
