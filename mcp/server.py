@@ -17,7 +17,7 @@ Session = sessionmaker(bind=engine)
 server = Server("wms-mcp", instructions=(
     "这是一个仓库货位地图（WMS）的 AI 接口，有多楼层，仓库里许多库位（A-01 这样的编号）被组合成具名的置物架（即编组，如「1号货架」），每个库位有多层。\n"
     "用户问东西在哪时：先用 wms_search_goods 按货物名搜索；搜不到时用 wms_view_images 按楼层逐层看照片比对找物，找到候选再用 wms_view_image 细看确认。\n"
-    "工具结果带 location 字段，已拼成人话位置（如「1F · 1号货架第2个库位第3层（A-03）」，组内库位顺序为先从上往下排、同一行从左往右数」）。回答位置时必须直接引用 location：先说货架名、组内第几个库位和第几层，库位编码只放在括号里作对照；不要只报 A-03 这类编码。只有该库位确实没有编组时，才用「楼层 + 编码」表达。\n"
+    "工具结果带 location 字段，已拼成人话位置（如「1F · 1号货架第2个库位第3层（A-03）」，组内库位顺序为从下往上排（第一排是最下面一排）、同一排从左往右数，层数同样从下往上（第1层是最底层）」）。回答位置时必须直接引用 location：先说货架名、组内第几个库位和第几层，库位编码只放在括号里作对照；不要只报 A-03 这类编码。只有该库位确实没有编组时，才用「楼层 + 编码」表达。\n"
     "修改库存、移动库位、改编组等写操作前，先用 wms_get_slot / wms_get_floor_map 核对目标格再执行。"
 ))
 
@@ -210,10 +210,12 @@ def _group_name_of_key(groups, key):
     return None
 
 def _group_pos_map(groups):
-    """key → (组名, 组内序号)。序号按阅读顺序：先从上往下排（行），同一行从左往右（列）"""
+    """key → (组名, 组内序号)。数位方向和层数一致：第一排是最下面一排（行号最大），
+    从下往上排；同一排从左往右（列）。单排货架时就是从左往右 1、2、3…"""
     out = {}
     for g in groups:
-        ms = sorted(g["members"], key=lambda m: tuple(int(v) for v in m.split(",")))
+        ms = sorted(g["members"],
+                    key=lambda m: (-int(m.split(",")[0]), int(m.split(",")[1])))
         for i, m in enumerate(ms):
             out[m] = (g["name"], i + 1)
     return out
