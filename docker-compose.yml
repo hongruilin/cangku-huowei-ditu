@@ -21,7 +21,8 @@ services:
       db:
         condition: service_healthy
     ports:
-      - "${PORT:-8000}:8000"
+      # WMS_BIND 默认 127.0.0.1（只绑本机，前置 Caddy/Nginx 反向代理更安全）；要让 Docker 直接对外改回 0.0.0.0
+      - "${WMS_BIND:-127.0.0.1}:${PORT:-8000}:8000"
     environment:
       DATABASE_URL: postgresql://wms:${PGPASSWORD:-wms}@db:5432/wms
       PGHOST: db
@@ -44,7 +45,7 @@ services:
       db:
         condition: service_healthy
     ports:
-      - "${MCP_PORT:-8001}:8001"
+      - "${WMS_BIND:-127.0.0.1}:${MCP_PORT:-8001}:8001"
     environment:
       DATABASE_URL: postgresql://wms:${PGPASSWORD:-wms}@db:5432/wms
       MCP_PORT: 8001

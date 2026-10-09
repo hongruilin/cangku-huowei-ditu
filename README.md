@@ -1,6 +1,6 @@
 # 仓库货位地图（开源 WMS）
 
-![version](https://img.shields.io/badge/version-v2.7.1-blue) ![license](https://img.shields.io/badge/license-MIT-green)
+![version](https://img.shields.io/badge/version-v2.7.3-blue) ![license](https://img.shields.io/badge/license-MIT-green)
 
 免费开源的仓库管理系统，适合小仓库、电商仓、工厂库房：自己画仓库地图，每个货位按层管理货物，一眼看到每层的名称、数量、状态和照片；手机和电脑都能用，Docker 一条命令部署。
 
@@ -13,6 +13,12 @@
 ---
 
 ## 最新更新
+
+**v2.7.3（2026-10-09）— 端口默认只绑本机**
+- Docker 端口默认绑 127.0.0.1，对外走 Caddy 等反向代理（Mac + IPv6 场景更顺）；直接暴露设 `WMS_BIND=0.0.0.0`
+
+**v2.7.2（2026-10-09）— 部署支持反向代理前置**
+- compose 新增 `WMS_BIND`：可把端口只绑在 127.0.0.1，再用 Caddy 双栈对外（解决 Mac Docker Desktop 下 IPv6 进不来的问题）
 
 **v2.7.1（2026-10-09）— 计数方向纠正**
 - 组内库位从下往上数（第一排是最下面一排），与「第1层是最底层」统一
@@ -80,7 +86,9 @@ docker compose logs app | tail -20
 
 ## 第三步：使用
 
-浏览器打开：`http://服务器IP:8000`
+在跑服务的这台机器上打开：`http://127.0.0.1:8000`
+
+> 出于安全，默认端口只绑本机。要从局域网/外网直接访问，二选一：在 `.env` 里写 `WMS_BIND=0.0.0.0` 重启（直接暴露），或保持默认，用 Caddy/Nginx 反向代理到 `127.0.0.1:8000` 对外（推荐）。
 
 - 默认账号：`admin` / `admin123`
 - 登录后右上角显示用户名，刷新不会掉登录（session cookie，7天有效）
@@ -103,6 +111,7 @@ docker compose logs app | tail -20
 | 重启 | `docker compose restart` |
 | 停止（数据保留） | `docker compose down` |
 | 换端口 | `PORT=9000 docker compose up -d` |
+| 直接对外（不走反向代理） | `WMS_BIND=0.0.0.0 docker compose up -d`（默认只绑本机 127.0.0.1，推荐前置 Caddy/Nginx 再对外，Mac 下也能解决 IPv6 到不了 Docker 的问题） |
 
 ---
 
