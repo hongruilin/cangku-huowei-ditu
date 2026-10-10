@@ -1,6 +1,6 @@
 # 仓库货位地图（开源 WMS）
 
-![version](https://img.shields.io/badge/version-v2.7.3-blue) ![license](https://img.shields.io/badge/license-MIT-green)
+![version](https://img.shields.io/badge/version-v2.7.4-blue) ![license](https://img.shields.io/badge/license-MIT-green)
 
 免费开源的仓库管理系统，适合小仓库、电商仓、工厂库房：自己画仓库地图，每个货位按层管理货物，一眼看到每层的名称、数量、状态和照片；手机和电脑都能用，Docker 一条命令部署。
 
@@ -13,6 +13,9 @@
 ---
 
 ## 最新更新
+
+**v2.7.4（2026-10-10）— 默认查看模式**
+- 打开页面默认是查看模式，不再一进来就是绘制，避免误触改图
 
 **v2.7.3（2026-10-09）— 端口默认只绑本机**
 - Docker 端口默认绑 127.0.0.1，对外走 Caddy 等反向代理（Mac + IPv6 场景更顺）；直接暴露设 `WMS_BIND=0.0.0.0`
