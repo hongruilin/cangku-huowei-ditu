@@ -1,6 +1,6 @@
 # 仓库货位地图（开源 WMS）
 
-![version](https://img.shields.io/badge/version-v2.7.4-blue) ![license](https://img.shields.io/badge/license-MIT-green)
+![version](https://img.shields.io/badge/version-v2.8.0-blue) ![license](https://img.shields.io/badge/license-MIT-green)
 
 免费开源的仓库管理系统，适合小仓库、电商仓、工厂库房：自己画仓库地图，每个货位按层管理货物，一眼看到每层的名称、数量、状态和照片；手机和电脑都能用，Docker 一条命令部署。
 
@@ -13,6 +13,10 @@
 ---
 
 ## 最新更新
+
+**v2.8.0（2026-10-12）— 操作日志 + 货物目录**
+- 操作日志查看（搜索/翻页，管理员可清空），MCP 可查 wms_list_op_logs
+- 货物目录：品类树 + 预存货物，录入时一键选用；目录随备份走；MCP 目录工具共 27 个
 
 **v2.7.4（2026-10-10）— 默认查看模式**
 - 打开页面默认是查看模式，不再一进来就是绘制，避免误触改图
