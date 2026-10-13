@@ -7,6 +7,7 @@ from .db import engine, Base, SessionLocal
 from . import models
 from .routers import auth as auth_router, warehouses as wh_router, map as map_router
 from .routers import upload as upload_router, backup as backup_router
+from .routers import logs as logs_router, goods as goods_router
 
 app = FastAPI(title="WMS 仓库管理系统", version="2.0.0")
 
@@ -23,10 +24,23 @@ app.include_router(wh_router.router)
 app.include_router(map_router.router)
 app.include_router(upload_router.router)
 app.include_router(backup_router.router)
+app.include_router(logs_router.router)
+app.include_router(goods_router.router)
 
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", os.path.join(os.path.dirname(__file__), "..", "uploads"))
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+
+# 注意：/api/* 路由必须在下面的 "/" 静态挂载之前注册，
+# 否则会被 StaticFiles 吃掉而返回 404。
+@app.get("/api/health")
+def health():
+    from datetime import datetime
+    return {"ok": True, "time": datetime.now().isoformat(), "version": get_version()}
+
+@app.get("/api/version")
+def version():
+    return {"version": get_version()}
 
 PUBLIC_DIR = os.path.join(os.path.dirname(__file__), "..", "public")
 if os.path.isdir(PUBLIC_DIR):
@@ -36,15 +50,6 @@ if os.path.isdir(PUBLIC_DIR):
         return FileResponse(os.path.join(PUBLIC_DIR, "index.html"),
                             headers={"Cache-Control": "no-store"})
     app.mount("/", StaticFiles(directory=PUBLIC_DIR, html=True), name="public")
-
-@app.get("/api/health")
-def health():
-    from datetime import datetime
-    return {"ok": True, "time": datetime.now().isoformat(), "version": get_version()}
-
-@app.get("/api/version")
-def version():
-    return {"version": get_version()}
 
 def get_version():
     try:
