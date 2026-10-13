@@ -72,6 +72,23 @@ class SlotGroup(Base):
     members = Column(Text, default="[]")
     sort_order = Column(Integer, default=0)
 
+class GoodsCategory(Base):
+    """货物目录品类（树形）：如 自行车系列 > 刹车零件"""
+    __tablename__ = "goods_categories"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(64), nullable=False)
+    parent_id = Column(Integer, ForeignKey("goods_categories.id", ondelete="CASCADE"), nullable=True)
+    sort_order = Column(Integer, default=0)
+
+class GoodsItem(Base):
+    """预存货物：录入时从目录选用，保持名称一致"""
+    __tablename__ = "goods_items"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(64), nullable=False)
+    category_id = Column(Integer, ForeignKey("goods_categories.id", ondelete="SET NULL"), nullable=True)
+    note = Column(String(255), default="")
+    sort_order = Column(Integer, default=0)
+
 class OpLog(Base):
     __tablename__ = "op_logs"
     id = Column(Integer, primary_key=True)
