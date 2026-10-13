@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from typing import Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from ..db import get_db
@@ -17,12 +18,12 @@ class FloorIn(BaseModel):
     cols: int = 14
 
 class FloorUpdate(BaseModel):
-    name: str = None
-    rows: int = None
-    cols: int = None
+    name: Optional[str] = None
+    rows: Optional[int] = None
+    cols: Optional[int] = None
 
 class StatusIn(BaseModel):
-    key: str = None
+    key: Optional[str] = None
     name: str
     color: str = "#e2e8f0"
 
@@ -48,9 +49,11 @@ def create_warehouse(data: WarehouseIn, user: models.User = Depends(require_role
 @router.delete("/warehouses/{wid}")
 def delete_warehouse(wid: int, user: models.User = Depends(require_role("admin")),
                      db: Session = Depends(get_db)):
+    w = db.query(models.Warehouse).filter(models.Warehouse.id == wid).first()
+    wname = w.name if w else "？"
     db.query(models.Warehouse).filter(models.Warehouse.id == wid).delete()
     db.commit()
-    log_op(db, user.id, "warehouse.delete", f"删除仓库 id={wid}")
+    log_op(db, user.id, "warehouse.delete", f"删除仓库「{wname}」(id={wid})")
     return {"ok": True}
 
 # ---- 楼层 ----
@@ -78,19 +81,33 @@ def update_floor(fid: int, data: FloorUpdate, user: models.User = Depends(requir
                  db: Session = Depends(get_db)):
     f = db.query(models.Floor).filter(models.Floor.id == fid).first()
     if not f: raise HTTPException(404, "楼层不存在")
-    if data.name is not None: f.name = data.name
-    if data.rows is not None: f.rows = max(1, min(60, data.rows))
-    if data.cols is not None: f.cols = max(1, min(60, data.cols))
+    changes = []
+    if data.name is not None and data.name != f.name:
+        changes.append(f"名称「{f.name}」→「{data.name}」")
+        f.name = data.name
+    if data.rows is not None:
+        nr = max(1, min(60, data.rows))
+        if nr != f.rows:
+            changes.append(f"行数 {f.rows}→{nr}")
+        f.rows = nr
+    if data.cols is not None:
+        nc = max(1, min(60, data.cols))
+        if nc != f.cols:
+            changes.append(f"列数 {f.cols}→{nc}")
+        f.cols = nc
     db.commit()
-    log_op(db, user.id, "floor.update", f"更新楼层 id={fid}")
+    log_op(db, user.id, "floor.update",
+           f"修改楼层「{f.name}」(id={fid})" + (f"：{'；'.join(changes)}" if changes else "（无实质改动）"))
     return {"floor": {"id": f.id, "name": f.name, "rows": f.rows, "cols": f.cols}}
 
 @router.delete("/floors/{fid}")
 def delete_floor(fid: int, user: models.User = Depends(require_role("operator")),
                  db: Session = Depends(get_db)):
+    f = db.query(models.Floor).filter(models.Floor.id == fid).first()
+    fname = f.name if f else "？"
     db.query(models.Floor).filter(models.Floor.id == fid).delete()
     db.commit()
-    log_op(db, user.id, "floor.delete", f"删除楼层 id={fid}")
+    log_op(db, user.id, "floor.delete", f"删除楼层「{fname}」(id={fid})")
     return {"ok": True}
 
 # ---- 状态 ----
@@ -125,8 +142,9 @@ def delete_status(sid: int, user: models.User = Depends(require_role("operator")
     s = db.query(models.Status).filter(models.Status.id == sid).first()
     if not s: raise HTTPException(404, "状态不存在")
     if s.builtin: raise HTTPException(400, "内置状态不可删除")
+    sname = s.name
     db.delete(s); db.commit()
-    log_op(db, user.id, "status.delete", f"删除状态 id={sid}")
+    log_op(db, user.id, "status.delete", f"删除状态「{sname}」(id={sid})")
     return {"ok": True}
 
 # ---- 区域 ----
@@ -147,20 +165,24 @@ def create_zone(fid: int, data: ZoneIn, user: models.User = Depends(require_role
 @router.delete("/zones/{zid}")
 def delete_zone(zid: int, user: models.User = Depends(require_role("operator")),
                 db: Session = Depends(get_db)):
+    z = db.query(models.Zone).filter(models.Zone.id == zid).first()
+    zname = z.name if z else "？"
     db.query(models.Zone).filter(models.Zone.id == zid).delete()
     db.commit()
-    log_op(db, user.id, "zone.delete", f"删除区域 id={zid}")
+    log_op(db, user.id, "zone.delete", f"删除区域「{zname}」(id={zid})")
     return {"ok": True}
 
 class ZoneUpdate(BaseModel):
-    name: str = None
+    name: Optional[str] = None
 
 @router.put("/zones/{zid}")
 def update_zone(zid: int, data: ZoneUpdate, user: models.User = Depends(require_role("operator")),
                 db: Session = Depends(get_db)):
     z = db.query(models.Zone).filter(models.Zone.id == zid).first()
     if not z: raise HTTPException(404, "区域不存在")
+    old_name = z.name
     if data.name is not None: z.name = data.name[:12]
     db.commit()
-    log_op(db, user.id, "zone.rename", f"区域改名 id={zid} -> {z.name}")
+    log_op(db, user.id, "zone.rename",
+           f"区域改名「{old_name}」→「{z.name}」(id={zid})" if old_name != z.name else f"区域「{z.name}」(id={zid})改名（无实质改动）")
     return {"ok": True}
