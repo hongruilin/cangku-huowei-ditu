@@ -2,6 +2,7 @@ import os, secrets
 from datetime import datetime
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
 from pydantic import BaseModel
+from typing import Optional
 from sqlalchemy.orm import Session
 from ..db import get_db
 from .. import models
@@ -13,7 +14,7 @@ UPLOAD_DIR = os.getenv("UPLOAD_DIR", os.path.join(os.path.dirname(__file__), "..
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 class DeleteIn(BaseModel):
-    key: str = None
+    key: Optional[str] = None
 
 @router.post("/upload")
 async def upload(file: UploadFile = File(...),
