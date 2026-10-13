@@ -74,13 +74,15 @@ def backup(user: models.User = Depends(require_role("admin")),
 
 # ============ 共享逻辑：全量导入（数据部分） ============
 
-def _apply_import(db: Session, statuses, floors):
+def _apply_import(db: Session, statuses, floors, goods_catalog=None):
     """把 statuses/floors 覆盖写入第一个仓库（调用方负责 commit 与日志）。
 
     接受格式：{statuses: [{id, name, color, builtin}],
                floors: [{name, rows, cols, zones: [{name, r0, c0, r1, c1}],
-                         slots: {"r,c": {levels: [{s, name, qty, img, note}]}}}]}
+                         slots: {"r,c": {levels: [{s, name, qty, img, note}]}}}],
+               goods_catalog: {categories: [{name, parent_id, sort_order}], items: [{name, category_id, note, sort_order}]}}
     slot key 为 "r,c"（行,列）；img 为 /uploads/... 存相对路径、http(s) 存原 URL、其它清空。
+    goods_catalog 不存在时不碰旧目录；存在则整体替换（品类树重建，货物按新映射归位）。
     """
     wh = db.query(models.Warehouse).order_by(models.Warehouse.id).first()
     if not wh:
@@ -163,6 +165,43 @@ def _apply_import(db: Session, statuses, floors):
                 db.add(models.SlotGroup(floor_id=fl.id, name=gname,
                                         members=json.dumps(members), sort_order=gorder))
 
+    # 货物目录：整体替换；品类 old id -> new id 映射（父节点先建，孤儿挂顶层），货物跟随
+    if isinstance(goods_catalog, dict) and (goods_catalog.get("categories") or goods_catalog.get("items")):
+        db.query(models.GoodsItem).delete(synchronize_session=False)
+        db.query(models.GoodsCategory).delete(synchronize_session=False)
+        db.flush()
+        old2new = {}
+        pending = [c for c in goods_catalog.get("categories", []) or []
+                   if isinstance(c, dict) and str(c.get("name", "")).strip()]
+        while pending:
+            rest = []
+            for c in pending:
+                pid = c.get("parent_id")
+                if pid is None or pid in old2new:
+                    cat = models.GoodsCategory(name=str(c["name"]).strip()[:64],
+                                               parent_id=old2new.get(pid),
+                                               sort_order=int(c.get("sort_order", 0) or 0))
+                    db.add(cat); db.flush()
+                    old2new[c.get("id")] = cat.id
+                else:
+                    rest.append(c)
+            if len(rest) == len(pending):
+                for c in rest:  # 孤儿节点：父 id 在列表里找不到，挂到顶层
+                    cat = models.GoodsCategory(name=str(c["name"]).strip()[:64],
+                                               parent_id=None,
+                                               sort_order=int(c.get("sort_order", 0) or 0))
+                    db.add(cat); db.flush()
+                    old2new[c.get("id")] = cat.id
+                break
+            pending = rest
+        for it in goods_catalog.get("items", []) or []:
+            if not isinstance(it, dict) or not str(it.get("name", "")).strip():
+                continue
+            db.add(models.GoodsItem(name=str(it["name"]).strip()[:64],
+                                    category_id=old2new.get(it.get("category_id")),
+                                    note=str(it.get("note", "") or "")[:255],
+                                    sort_order=int(it.get("sort_order", 0) or 0)))
+
 
 def _referenced_local_images(floors):
     """从备份 floors 数据里收集被引用的本地图片相对路径（外链不算）"""
@@ -227,9 +266,20 @@ def _collect_package(db: Session, wid: int):
         })
     sts = db.query(models.Status).filter(
         (models.Status.warehouse_id.is_(None)) | (models.Status.warehouse_id == wid)).all()
+    gcats = db.query(models.GoodsCategory).order_by(models.GoodsCategory.sort_order,
+                                                    models.GoodsCategory.id).all()
+    gitems = db.query(models.GoodsItem).order_by(models.GoodsItem.sort_order,
+                                                 models.GoodsItem.id).all()
     pkg = {
         "statuses": [{"id": s.key, "name": s.name, "color": s.color, "builtin": bool(s.builtin)} for s in sts],
         "floors": out_floors,
+        # 货物目录是全库共享的，不属于某个仓库；导出时顺带带上，恢复时整体替换
+        "goods_catalog": {
+            "categories": [{"id": c.id, "name": c.name, "parent_id": c.parent_id,
+                            "sort_order": c.sort_order} for c in gcats],
+            "items": [{"name": i.name, "category_id": i.category_id, "note": i.note or "",
+                       "sort_order": i.sort_order} for i in gitems],
+        },
     }
     return pkg, entries, missing
 
@@ -240,6 +290,7 @@ class ImportIn(BaseModel):
     statuses: list = []
     floors: list = []
     images: Dict[str, str] = {}  # 本地图片相对路径 -> data URL
+    goods_catalog: dict = None  # 货物目录：{categories:[...], items:[...]}，有则整体替换
 
 
 @router.post("/import")
@@ -250,7 +301,7 @@ def import_data(data: ImportIn,
     images 里的本地图片（base64 data URL）会写回 uploads；外链图只存 URL。
     图片很多时请用 ZIP 备份包（/api/import-archive），别用 base64 JSON。
     """
-    _apply_import(db, data.statuses, data.floors)
+    _apply_import(db, data.statuses, data.floors, goods_catalog=data.goods_catalog)
 
     upload_dir = _upload_dir()
     written = skipped = 0
@@ -429,7 +480,8 @@ async def import_archive(file: UploadFile = File(...),
         except OSError:
             pass
 
-    _apply_import(db, pkg.get("statuses") or [], floors)
+    _apply_import(db, pkg.get("statuses") or [], floors,
+                goods_catalog=pkg.get("goods_catalog"))
     refs = _referenced_local_images(floors)
     missing_n = sum(1 for rel in refs if not os.path.isfile(os.path.join(upload_dir, rel)))
     log_op(db, user.id, "system.import_archive",
