@@ -18,7 +18,10 @@ server = Server("wms-mcp", instructions=(
     "这是一个仓库货位地图（WMS）的 AI 接口，有多楼层，仓库里许多库位（A-01 这样的编号）被组合成具名的置物架（即编组，如「1号货架」），每个库位有多层。\n"
     "用户问东西在哪时：先用 wms_search_goods 按货物名搜索；搜不到时用 wms_view_images 按楼层逐层看照片比对找物，找到候选再用 wms_view_image 细看确认。\n"
     "工具结果带 location 字段，已拼成人话位置（如「1F · 1号货架第2个库位第3层（A-03）」，组内库位顺序为从下往上排（第一排是最下面一排）、同一排从左往右数，层数同样从下往上（第1层是最底层）」）。回答位置时必须直接引用 location：先说货架名、组内第几个库位和第几层，库位编码只放在括号里作对照；不要只报 A-03 这类编码。只有该库位确实没有编组时，才用「楼层 + 编码」表达。\n"
-    "修改库存、移动库位、改编组等写操作前，先用 wms_get_slot / wms_get_floor_map 核对目标格再执行。"
+    "修改库存、移动库位、改编组等写操作前，先用 wms_get_slot / wms_get_floor_map 核对目标格再执行。\n"
+    "货物名称尽量用目录里的标准名：录入前用 wms_list_goods_items 或 wms_list_goods_catalog 查一下目录，没有再存新货（wms_create_goods_item），避免同一货物叫出多种名字。\n"
+    "用户要查操作记录时用 wms_list_op_logs（动作、明细、时间都有，谁操作的也看得到）。\n"
+    "数量为 0 的层级视为无货：wms_search_goods 已自动过滤只返回有货的；查哪些没货/缺货用 wms_list_out_of_stock；wms_get_slot / wms_get_floor_map 的层级带 is_empty 字段，为 true 时向用户描述为「空」，不要报出货名。"
 ))
 
 TOOLS = [
@@ -30,10 +33,13 @@ TOOLS = [
     Tool(name="wms_get_floor_map", description="获取某楼层完整地图（库位、层级、货物、区域）",
          inputSchema={"type": "object", "properties": {
              "floor_id": {"type": "number"}}, "required": ["floor_id"]}),
-    Tool(name="wms_search_goods", description="按货物名称搜索库位",
+    Tool(name="wms_search_goods", description="按货物名称搜索库位（只返回有货的；查没货的用 wms_list_out_of_stock）",
          inputSchema={"type": "object", "properties": {
              "keyword": {"type": "string"},
              "warehouse_id": {"type": "number"}}, "required": ["keyword"]}),
+    Tool(name="wms_list_out_of_stock", description="查询已无货的货物：数量为 0 但还留着货名的层级及位置，用于补货检查",
+         inputSchema={"type": "object", "properties": {
+             "warehouse_id": {"type": "number"}}}),
     Tool(name="wms_get_slot", description="获取指定库位详情",
          inputSchema={"type": "object", "properties": {
              "floor_id": {"type": "number"},
@@ -110,6 +116,45 @@ TOOLS = [
          inputSchema={"type": "object", "properties": {
              "floor_id": {"type": "number"},
              "group_id": {"type": "number"}}, "required": ["floor_id", "group_id"]}),
+    Tool(name="wms_list_op_logs", description="查看操作日志：谁在什么时候做了什么（地图保存、图片上传、移动复制、目录改动等），支持关键词和翻页",
+         inputSchema={"type": "object", "properties": {
+             "q": {"type": "string", "description": "关键词，在动作和明细里找（可选）"},
+             "limit": {"type": "number", "description": "这次最多返回几条，默认 50，上限 200"},
+             "offset": {"type": "number", "description": "从第几条开始（翻页用），默认 0"}}}),
+    Tool(name="wms_list_goods_catalog", description="查看货物目录：品类树（如 自行车系列 > 刹车零件）及每个品类下的预存货物。录入货名时先查这里，保持名称一致",
+         inputSchema={"type": "object", "properties": {}}),
+    Tool(name="wms_create_category", description="新建品类：name 是品类名，parent_id 是父品类 id（可选，顶层品类不传）",
+         inputSchema={"type": "object", "properties": {
+             "name": {"type": "string", "description": "品类名，如 自行车系列"},
+             "parent_id": {"type": "number", "description": "父品类 id（可选）"}}, "required": ["name"]}),
+    Tool(name="wms_update_category", description="修改品类：改名和/或换父品类（parent_id 传 -1 移到顶层）",
+         inputSchema={"type": "object", "properties": {
+             "category_id": {"type": "number"},
+             "name": {"type": "string"},
+             "parent_id": {"type": "number", "description": "新的父品类 id，-1 移到顶层"}}, "required": ["category_id"]}),
+    Tool(name="wms_delete_category", description="删除品类：其子孙品类一起删，里面的货物移到「未分类」，货物数据不丢",
+         inputSchema={"type": "object", "properties": {
+             "category_id": {"type": "number"}}, "required": ["category_id"]}),
+    Tool(name="wms_list_goods_items", description="按关键词或品类查预存货物",
+         inputSchema={"type": "object", "properties": {
+             "keyword": {"type": "string", "description": "货名关键词（可选）"},
+             "category_id": {"type": "number", "description": "只看某个品类下（可选）"},
+             "limit": {"type": "number", "description": "最多返回几件，默认 200"},
+             "offset": {"type": "number"}}}),
+    Tool(name="wms_create_goods_item", description="往目录里预存一件货物：name 是货名，category_id 是所属品类 id（可选），note 备注",
+         inputSchema={"type": "object", "properties": {
+             "name": {"type": "string"},
+             "category_id": {"type": "number"},
+             "note": {"type": "string"}}, "required": ["name"]}),
+    Tool(name="wms_update_goods_item", description="修改预存货物：改名/换品类/category_id 传 -1 移入未分类/改备注。改名会自动把库位上同名的货物一起改名",
+         inputSchema={"type": "object", "properties": {
+             "item_id": {"type": "number"},
+             "name": {"type": "string"},
+             "category_id": {"type": "number", "description": "-1 移入未分类"},
+             "note": {"type": "string"}}, "required": ["item_id"]}),
+    Tool(name="wms_delete_goods_item", description="从目录里删除一件预存货物（不影响已录入到库位的货名）",
+         inputSchema={"type": "object", "properties": {
+             "item_id": {"type": "number"}}, "required": ["item_id"]}),
 ]
 
 def code_to_rc(code: str):
@@ -134,6 +179,36 @@ def _img_out(p):
     """库里 img_path 转可用地址：外链原样，本地相对路径拼 /uploads/"""
     if not p: return None
     return p if str(p).startswith(("http://", "https://")) else f"/uploads/{p}"
+
+def _has_goods(lv):
+    """数量为 0 视为无货：一切展示都按空处理"""
+    try:
+        return (lv.get("qty") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+def _goods_label(lv):
+    """层级的人话货名：数量为 0 按「空」显示"""
+    if not _has_goods(lv):
+        return "「空」"
+    return f"「{lv['name']}」x{lv['qty']}"
+
+def _status_name(db, warehouse_id, key):
+    """状态 key 转显示名（先查仓库自定义，再查内置）"""
+    if warehouse_id is not None:
+        r = db.execute(text("SELECT name FROM statuses WHERE warehouse_id=:wid AND key=:k"),
+                       {"wid": warehouse_id, "k": key}).mappings().first()
+        if r: return r["name"]
+    r = db.execute(text("SELECT name FROM statuses WHERE warehouse_id IS NULL AND key=:k"),
+                   {"k": key}).mappings().first()
+    return r["name"] if r else key
+
+def _cat_name_q(cid):
+    """品类 id 转显示名（None=顶层），供日志用"""
+    if cid is None:
+        return "顶层"
+    r = q_one("SELECT name FROM goods_categories WHERE id=:cid", {"cid": cid})
+    return r["name"] if r else "？"
 
 def _img_bytes(img_value):
     """把 img 地址取回图片字节：本地读 UPLOAD_DIR 下文件，外链用 HTTP 下载。
@@ -287,7 +362,7 @@ def _image_tool(a, single):
         if err: raise ValueError(err)
         b64, mime = _vision_b64(raw, 1024)
         gname1, gord1 = _group_pos_map(_groups_of(fid)).get(f"{slot['r']},{slot['c']}", (None, None))
-        label = f"{_loc(fname, gname1, gord1, _slot_code(slot['r'], slot['c']), idx)}「{lv['name']}」x{lv['qty']}"
+        label = f"{_loc(fname, gname1, gord1, _slot_code(slot['r'], slot['c']), idx)}{_goods_label(lv)}"
         if lv["note"]: label += f"（备注：{lv['note']}）"
         return [TextContent(type="text", text=label + " 的照片："),
                 ImageContent(type="image", data=b64, mimeType=mime)]
@@ -314,7 +389,7 @@ def _image_tool(a, single):
     for row in rows:
         n = offset + shown + 1
         gnameB, gordB = pos_map.get(f"{row['r']},{row['c']}", (None, None))
-        pos = f"{_loc(fname, gnameB, gordB, _slot_code(row['r'], row['c']), row['level_index'])}「{row['name']}」x{row['qty']}"
+        pos = f"{_loc(fname, gnameB, gordB, _slot_code(row['r'], row['c']), row['level_index'])}{_goods_label(row)}"
         raw, err = _img_bytes(_img_out(row["img_path"]))
         if err:
             lines.append(f"图{n} {pos}（读取失败：{err}）")
@@ -333,6 +408,23 @@ def _image_tool(a, single):
 @server.list_tools()
 async def list_tools():
     return TOOLS
+
+def _enrich_goods_rows(result):
+    """给搜货/查没货的行补 img/code/group/location"""
+    gcache = {}
+    for row in result:
+        row["img"] = _img_out(row.pop("img_path", None))
+        code_ = _slot_code(row["r"], row["c"])
+        row["code"] = code_
+        fid_ = row.get("floor_id")
+        if fid_ not in gcache:
+            gcache[fid_] = _group_pos_map(_groups_of(fid_))
+        gname, gord = gcache[fid_].get(f"{row['r']},{row['c']}", (None, None))
+        row["group"] = gname
+        row["group_index"] = gord
+        row["location"] = _loc(row.get("floor"), gname, gord, code_, row.get("level_index"))
+        row.pop("floor_id", None); row.pop("r", None); row.pop("c", None)
+    return result
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict):
@@ -357,6 +449,7 @@ async def call_tool(name: str, arguments: dict):
             by_slot = {}
             for lv in levels:
                 lv["img"] = _img_out(lv.pop("img_path", None))
+                lv["is_empty"] = not _has_goods(lv)
                 by_slot.setdefault(lv["slot_id"], []).append(lv)
             out = []
             groups = _groups_of(fid)
@@ -379,25 +472,23 @@ async def call_tool(name: str, arguments: dict):
                             l.level_index, l.status_key, l.name, l.qty, l.note, l.img_path
                      FROM levels l JOIN slots s ON s.id=l.slot_id
                      JOIN floors f ON f.id=s.floor_id JOIN warehouses w ON w.id=f.warehouse_id
-                     WHERE lower(l.name) LIKE :kw"""
+                     WHERE lower(l.name) LIKE :kw AND l.qty > 0"""
             params = {"kw": f"%{str(a['keyword']).lower()}%"}
             if a.get("warehouse_id"):
                 sql += " AND w.id=:wid"; params["wid"] = a["warehouse_id"]
             sql += " ORDER BY w.id,f.id,s.r,s.c,l.level_index LIMIT 100"
-            result = q(sql, params)
-            gcache = {}
-            for row in result:
-                row["img"] = _img_out(row.pop("img_path", None))
-                code_ = _slot_code(row["r"], row["c"])
-                row["code"] = code_
-                fid_ = row.get("floor_id")
-                if fid_ not in gcache:
-                    gcache[fid_] = _group_pos_map(_groups_of(fid_))
-                gname, gord = gcache[fid_].get(f"{row['r']},{row['c']}", (None, None))
-                row["group"] = gname
-                row["group_index"] = gord
-                row["location"] = _loc(row.get("floor"), gname, gord, code_, row.get("level_index"))
-                row.pop("floor_id", None); row.pop("r", None); row.pop("c", None)
+            result = _enrich_goods_rows(q(sql, params))
+        elif name == "wms_list_out_of_stock":
+            sql = """SELECT w.name AS warehouse, f.name AS floor, f.id AS floor_id, s.r, s.c,
+                            l.level_index, l.status_key, l.name, l.qty, l.note, l.img_path
+                     FROM levels l JOIN slots s ON s.id=l.slot_id
+                     JOIN floors f ON f.id=s.floor_id JOIN warehouses w ON w.id=f.warehouse_id
+                     WHERE l.qty = 0 AND l.name IS NOT NULL AND l.name <> ''"""
+            params = {}
+            if a.get("warehouse_id"):
+                sql += " AND w.id=:wid"; params["wid"] = a["warehouse_id"]
+            sql += " ORDER BY w.id,f.id,s.r,s.c,l.level_index LIMIT 200"
+            result = _enrich_goods_rows(q(sql, params))
         elif name == "wms_get_slot":
             rc = code_to_rc(a["code"])
             if not rc: raise ValueError("库位编码格式错误，应为如 B-04")
@@ -415,6 +506,7 @@ async def call_tool(name: str, arguments: dict):
                 gname, gord = _group_pos_map(groups).get(key, (None, None))
                 for lv in levels:
                     lv["img"] = _img_out(lv.pop("img_path", None))
+                    lv["is_empty"] = not _has_goods(lv)
                     lv["location"] = _loc(fname_, gname, gord, a["code"], lv.get("level_index"))
                 result = {"code": a["code"], "exists": True, "levels": levels, "group": gname,
                           "group_index": gord,
@@ -445,14 +537,40 @@ async def call_tool(name: str, arguments: dict):
                     else:
                         raise ValueError("img 仅支持 /uploads/ 路径、http(s) 链接或空字符串")
                 if not colvals: raise ValueError("没有要更新的字段")
+                old_lv = db.execute(
+                    text("SELECT status_key,name,qty,note FROM levels WHERE slot_id=:sid AND level_index=:idx"),
+                    {"sid": sid, "idx": a["level_index"]}).mappings().first()
+                old_qty = (old_lv["qty"] or 0) if old_lv else 0
+                if "status_key" not in colvals and "qty" in colvals:
+                    if colvals["qty"] == 0:
+                        colvals["status_key"] = "empty"  # 数量为 0 自动置空状态
+                    elif colvals["qty"] > 0 and old_qty == 0:
+                        colvals["status_key"] = "full"  # 数量从 0 改为正数，自动变为有货
                 ins = {"status_key": "empty", "name": "", "qty": 0, "note": "", "img_path": None}
                 ins.update(colvals)
                 params = {"sid": sid, "idx": a["level_index"], **ins}
                 db.execute(text(f"""INSERT INTO levels (slot_id,level_index,status_key,name,qty,img_path,note)
                                     VALUES (:sid,:idx,:status_key,:name,:qty,:img_path,:note)
                                     ON CONFLICT (slot_id,level_index) DO UPDATE SET {','.join(k + '=:' + k for k in colvals)}"""), params)
+                wid_of = db.execute(text("SELECT warehouse_id FROM floors WHERE id=:fid"),
+                                    {"fid": a["floor_id"]}).mappings().first()
+                wid_of = wid_of["warehouse_id"] if wid_of else None
+                changes = []
+                if old_lv is None:
+                    changes.append("新建层级")
+                else:
+                    if "name" in colvals and (colvals["name"] or "") != (old_lv["name"] or ""):
+                        changes.append(f"货名「{old_lv['name'] or '（空）'}」→「{colvals['name'] or '（空）'}」")
+                    if "qty" in colvals and colvals["qty"] != (old_lv["qty"] or 0):
+                        changes.append(f"数量 {old_lv['qty']}→{colvals['qty']}")
+                    if "status_key" in colvals and colvals["status_key"] != old_lv["status_key"]:
+                        changes.append(f"状态 {_status_name(db, wid_of, old_lv['status_key'])}→{_status_name(db, wid_of, colvals['status_key'])}")
+                    if "note" in colvals and (colvals["note"] or "") != (old_lv["note"] or ""):
+                        changes.append("备注已修改")
+                    if "img_path" in colvals:
+                        changes.append("照片已更新" if colvals["img_path"] else "照片已清除")
                 db.execute(text("INSERT INTO op_logs (action, detail) VALUES ('mcp.update_level', :d)"),
-                           {"d": f"{a['code']} 第{a['level_index']+1}层"})
+                           {"d": f"{a['code']} 第{a['level_index']+1}层" + (f"：{'；'.join(changes)}" if changes else "（无实质改动）")})
                 db.commit()
                 result = {"ok": True}
             finally:
@@ -675,6 +793,220 @@ async def call_tool(name: str, arguments: dict):
                        {"fid": a["floor_id"]})
         elif name in ("wms_view_image", "wms_view_images"):
             return _image_tool(a, single=(name == "wms_view_image"))
+        elif name == "wms_list_op_logs":
+            lim = min(200, max(1, int(a.get("limit") or 50)))
+            off = max(0, int(a.get("offset") or 0))
+            sql = """SELECT l.id, l.user_id, COALESCE(u.username, 'AI/MCP') AS username,
+                            l.action, l.detail, l.created_at
+                     FROM op_logs l LEFT JOIN users u ON u.id=l.user_id"""
+            params = {}
+            if a.get("q"):
+                sql += " WHERE l.action LIKE :kw OR l.detail LIKE :kw"
+                params["kw"] = f"%{a['q']}%"
+            total = q_one(f"SELECT COUNT(*) AS n FROM ({sql}) t", params)["n"]
+            rows = q(sql + " ORDER BY l.id DESC LIMIT :lim OFFSET :off", {**params, "lim": lim, "off": off})
+            for r in rows:
+                if r.get("created_at") is not None:
+                    r["created_at"] = str(r["created_at"])
+            result = {"total": total, "items": rows}
+        elif name == "wms_list_goods_catalog":
+            cats = q("SELECT id, name, parent_id, sort_order FROM goods_categories ORDER BY sort_order, id")
+            items = q("""SELECT i.id, i.name, i.category_id, i.note,
+                                (SELECT name FROM goods_categories c WHERE c.id=i.category_id) AS category_name
+                         FROM goods_items i ORDER BY i.sort_order, i.id""")
+            by_parent = {}
+            for c in cats:
+                by_parent.setdefault(c["parent_id"], []).append(c)
+            def _node(c):
+                return {"id": c["id"], "name": c["name"],
+                        "items": [it for it in items if it["category_id"] == c["id"]],
+                        "children": [_node(x) for x in by_parent.get(c["id"], [])]}
+            result = {"tree": [_node(c) for c in by_parent.get(None, [])],
+                      "uncategorized": [it for it in items if not it["category_id"]]}
+        elif name == "wms_create_category":
+            name_g = str(a.get("name", "")).strip()
+            if not name_g: raise ValueError("品类名不能为空")
+            pid = a.get("parent_id")
+            if pid is not None:
+                if not q_one("SELECT id FROM goods_categories WHERE id=:pid", {"pid": int(pid)}):
+                    raise ValueError("父品类不存在")
+                pid = int(pid)
+            db = Session()
+            try:
+                gid = db.execute(text("INSERT INTO goods_categories (name, parent_id, sort_order) VALUES (:nm,:pid,0) RETURNING id"),
+                                 {"nm": name_g[:64], "pid": pid}).mappings().first()["id"]
+                db.execute(text("INSERT INTO op_logs (action, detail) VALUES ('mcp.goods_category.create', :d)"),
+                           {"d": f"新增品类 {name_g}(id={gid})"})
+                db.commit()
+            finally:
+                db.close()
+            result = {"ok": True, "id": gid, "name": name_g[:64], "parent_id": pid}
+        elif name == "wms_update_category":
+            cid = int(a["category_id"])
+            c = q_one("SELECT name, parent_id FROM goods_categories WHERE id=:cid", {"cid": cid})
+            if not c: raise ValueError("品类不存在")
+            db = Session()
+            try:
+                changes = []
+                if a.get("name") is not None:
+                    nm = str(a["name"]).strip()
+                    if not nm: raise ValueError("品类名不能为空")
+                    if nm[:64] != c["name"]:
+                        changes.append(f"名称「{c['name']}」→「{nm[:64]}」")
+                    db.execute(text("UPDATE goods_categories SET name=:nm WHERE id=:cid"), {"nm": nm[:64], "cid": cid})
+                if a.get("parent_id") is not None:
+                    pid = int(a["parent_id"])
+                    if pid == cid: raise ValueError("不能把自己设为自己的父品类")
+                    if pid < 0:
+                        new_pid = None
+                        db.execute(text("UPDATE goods_categories SET parent_id=NULL WHERE id=:cid"), {"cid": cid})
+                    else:
+                        if not db.execute(text("SELECT id FROM goods_categories WHERE id=:pid"),
+                                          {"pid": pid}).mappings().first():
+                            raise ValueError("父品类不存在")
+                        # 不能移到自己子孙下面：从目标父往上走，不能经过自己
+                        cur, seen = pid, set()
+                        while cur is not None and cur not in seen:
+                            if cur == cid: raise ValueError("不能把品类移到自己的子孙下面")
+                            seen.add(cur)
+                            cur = db.execute(text("SELECT parent_id FROM goods_categories WHERE id=:x"),
+                                             {"x": cur}).mappings().first()["parent_id"]
+                        new_pid = pid
+                        db.execute(text("UPDATE goods_categories SET parent_id=:pid WHERE id=:cid"),
+                                   {"pid": pid, "cid": cid})
+                    if new_pid != c["parent_id"]:
+                        changes.append(f"父品类「{_cat_name_q(c['parent_id'])}」→「{_cat_name_q(new_pid)}」")
+                new_name = str(a["name"]).strip()[:64] if a.get("name") is not None else c["name"]
+                db.execute(text("INSERT INTO op_logs (action, detail) VALUES ('mcp.goods_category.update', :d)"),
+                           {"d": f"修改品类「{new_name}」(id={cid})" + (f"：{'；'.join(changes)}" if changes else "（无实质改动）")})
+                db.commit()
+            finally:
+                db.close()
+            result = {"ok": True, "id": cid}
+        elif name == "wms_delete_category":
+            cid = int(a["category_id"])
+            c0 = q_one("SELECT name FROM goods_categories WHERE id=:cid", {"cid": cid})
+            if not c0: raise ValueError("品类不存在")
+            # 递归收子孙
+            ids, stack = set(), [cid]
+            while stack:
+                cur = stack.pop()
+                if cur in ids: continue
+                ids.add(cur)
+                kids = q("SELECT id FROM goods_categories WHERE parent_id=:x", {"x": cur})
+                stack += [k["id"] for k in kids]
+            db = Session()
+            try:
+                ph = ",".join(f":d{i}" for i in range(len(ids)))
+                pm = {f"d{i}": v for i, v in enumerate(ids)}
+                n_items = db.execute(text(f"UPDATE goods_items SET category_id=NULL WHERE category_id IN ({ph})"), pm).rowcount
+                db.execute(text(f"DELETE FROM goods_categories WHERE id IN ({ph})"), pm)
+                db.execute(text("INSERT INTO op_logs (action, detail) VALUES ('mcp.goods_category.delete', :d)"),
+                           {"d": f"删除品类「{c0['name']}」(id={cid}，含 {len(ids)-1} 个子品类），{n_items} 件货物移入未分类"})
+                db.commit()
+            finally:
+                db.close()
+            result = {"ok": True, "deleted": cid}
+        elif name == "wms_list_goods_items":
+            where, params = [], {}
+            if a.get("keyword"):
+                where.append("i.name LIKE :kw"); params["kw"] = f"%{a['keyword']}%"
+            if a.get("category_id") is not None:
+                where.append("i.category_id=:cid2"); params["cid2"] = int(a["category_id"])
+            w = (" WHERE " + " AND ".join(where)) if where else ""
+            lim = min(1000, max(1, int(a.get("limit") or 200)))
+            off = max(0, int(a.get("offset") or 0))
+            total = q_one(f"SELECT COUNT(*) AS n FROM goods_items i{w}", params)["n"]
+            rows = q(f"""SELECT i.id, i.name, i.category_id, i.note,
+                                (SELECT name FROM goods_categories c WHERE c.id=i.category_id) AS category_name
+                         FROM goods_items i{w} ORDER BY i.sort_order, i.id LIMIT :lim OFFSET :off""",
+                     {**params, "lim": lim, "off": off})
+            result = {"total": total, "items": rows}
+        elif name == "wms_create_goods_item":
+            nm = str(a.get("name", "")).strip()
+            if not nm: raise ValueError("货名不能为空")
+            cid2 = a.get("category_id")
+            if cid2 is not None:
+                if not q_one("SELECT id FROM goods_categories WHERE id=:cid", {"cid": int(cid2)}):
+                    raise ValueError("品类不存在")
+                cid2 = int(cid2)
+            db = Session()
+            try:
+                iid = db.execute(text("INSERT INTO goods_items (name, category_id, note, sort_order) VALUES (:nm,:cid,:note,0) RETURNING id"),
+                                 {"nm": nm[:64], "cid": cid2, "note": str(a.get("note", "") or "")[:255]}).mappings().first()["id"]
+                db.execute(text("INSERT INTO op_logs (action, detail) VALUES ('mcp.goods_item.create', :d)"),
+                           {"d": f"新增货物 {nm}(id={iid})"})
+                db.commit()
+            finally:
+                db.close()
+            result = {"ok": True, "id": iid, "name": nm[:64]}
+        elif name == "wms_update_goods_item":
+            iid = int(a["item_id"])
+            old = q_one("SELECT name, note, category_id FROM goods_items WHERE id=:iid", {"iid": iid})
+            if not old:
+                raise ValueError("货物不存在")
+            db = Session()
+            try:
+                sets, params = [], {"iid": iid}
+                changes = []
+                new_nm = None
+                if a.get("name") is not None:
+                    nm = str(a["name"]).strip()
+                    if not nm: raise ValueError("货名不能为空")
+                    sets.append("name=:nm"); params["nm"] = nm[:64]
+                    if params["nm"] != old["name"]:
+                        changes.append(f"货名「{old['name']}」→「{params['nm']}」")
+                        new_nm = params["nm"]
+                if a.get("note") is not None:
+                    nn = str(a["note"] or "")[:255]
+                    sets.append("note=:note"); params["note"] = nn
+                    if nn != (old["note"] or ""):
+                        changes.append("备注已修改")
+                if a.get("category_id") is not None:
+                    cid2 = int(a["category_id"])
+                    if cid2 < 0:
+                        sets.append("category_id=NULL")
+                        new_cid = None
+                    else:
+                        if not db.execute(text("SELECT id FROM goods_categories WHERE id=:cid"),
+                                          {"cid": cid2}).mappings().first():
+                            raise ValueError("品类不存在")
+                        sets.append("category_id=:cid2"); params["cid2"] = cid2
+                        new_cid = cid2
+                    if new_cid != old["category_id"]:
+                        changes.append(f"品类「{_cat_name_q(old['category_id'])}」→「{_cat_name_q(new_cid)}」")
+                if not sets: raise ValueError("没有要更新的字段")
+                db.execute(text(f"UPDATE goods_items SET {', '.join(sets)} WHERE id=:iid"), params)
+                renamed_levels = 0
+                if new_nm is not None:
+                    # 改名级联：库位层级里与旧名完全相同的，一并改成新名
+                    r = db.execute(text("UPDATE levels SET name=:new WHERE name=:old"),
+                                   {"new": new_nm, "old": old["name"]})
+                    renamed_levels = r.rowcount or 0
+                final_name = params.get("nm", old["name"])
+                detail = f"修改货物「{final_name}」(id={iid})" + (f"：{'；'.join(changes)}" if changes else "（无实质改动）")
+                if renamed_levels:
+                    detail += f"，改名同步 {renamed_levels} 个库位层级"
+                db.execute(text("INSERT INTO op_logs (action, detail) VALUES ('mcp.goods_item.update', :d)"),
+                           {"d": detail})
+                db.commit()
+            finally:
+                db.close()
+            result = {"ok": True, "id": iid, "renamed_levels": renamed_levels}
+        elif name == "wms_delete_goods_item":
+            iid = int(a["item_id"])
+            g0 = q_one("SELECT name FROM goods_items WHERE id=:iid", {"iid": iid})
+            if not g0:
+                raise ValueError("货物不存在")
+            db = Session()
+            try:
+                db.execute(text("DELETE FROM goods_items WHERE id=:iid"), {"iid": iid})
+                db.execute(text("INSERT INTO op_logs (action, detail) VALUES ('mcp.goods_item.delete', :d)"),
+                           {"d": f"删除货物「{g0['name']}」(id={iid})"})
+                db.commit()
+            finally:
+                db.close()
+            result = {"ok": True, "deleted": iid}
         else:
             raise ValueError(f"未知工具: {name}")
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2, default=str))]
