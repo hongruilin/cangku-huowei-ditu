@@ -7,6 +7,7 @@ COPY app/ ./app/
 COPY mcp/ ./mcp/
 COPY public/ ./public/
 COPY mac-deploy/ ./mac-deploy/
+COPY VERSION ./
 RUN mkdir -p uploads data
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
