@@ -15,6 +15,35 @@ class MapSave(BaseModel):
 def _code(r: int, c: int) -> str:
     return chr(65 + r) + "-" + str(c + 1).zfill(2)
 
+def _status_name(db: Session, wid, key: str) -> str:
+    """状态 key 转显示名（先查仓库自定义，再查内置）"""
+    if wid is not None:
+        s = db.query(models.Status).filter(models.Status.warehouse_id == wid,
+                                           models.Status.key == key).first()
+        if s: return s.name
+    s = db.query(models.Status).filter(models.Status.warehouse_id.is_(None),
+                                      models.Status.key == key).first()
+    return s.name if s else key
+
+
+def _level_diff(db: Session, wid, code: str, idx: int, o: dict, n: dict):
+    """单个层级旧→新差异，返回描述片段列表"""
+    fds = []
+    if (o["name"] or "") != (n["name"] or ""):
+        fds.append(f"货名「{o['name'] or '（空）'}」→「{n['name'] or '（空）'}」")
+    if (o["qty"] or 0) != (n["qty"] or 0):
+        fds.append(f"数量 {o['qty']}→{n['qty']}")
+    if o["status_key"] != n["status_key"]:
+        fds.append(f"状态 {_status_name(db, wid, o['status_key'])}→{_status_name(db, wid, n['status_key'])}")
+    if (o["note"] or "") != (n["note"] or ""):
+        fds.append("备注已修改")
+    if bool(o["img_path"]) != bool(n["img_path"]):
+        fds.append("照片已更新" if n["img_path"] else "照片已清除")
+    if not fds:
+        return None
+    return f"{code} 第{idx + 1}层" + "、".join(fds)
+
+
 def _img_out(img_path):
     """库里存的 img_path 转前端可用地址：外链原样返回，本地相对路径拼 /uploads/"""
     if not img_path:
@@ -77,14 +106,25 @@ def save_map(fid: int, data: MapSave, user: models.User = Depends(require_role("
              db: Session = Depends(get_db)):
     f = db.query(models.Floor).filter(models.Floor.id == fid).first()
     if not f: raise HTTPException(404, "楼层不存在")
+    wid = f.warehouse_id
+    # 先快照旧层级，供保存后做改动 diff（日志用）
+    old_levels = {}
+    old_slots = db.query(models.Slot).filter(models.Slot.floor_id == fid).all()
+    for s in old_slots:
+        for lv in db.query(models.Level).filter(models.Level.slot_id == s.id).all():
+            old_levels[(s.r, s.c, lv.level_index)] = {
+                "status_key": lv.status_key, "name": lv.name or "", "qty": lv.qty or 0,
+                "note": lv.note or "", "img_path": lv.img_path}
+    old_n_group = db.query(models.SlotGroup).filter(models.SlotGroup.floor_id == fid).count()
     # 清旧库位：先显式删层级，再删库位（不依赖数据库级联行为）
-    old_slot_ids = [s.id for s in db.query(models.Slot.id).filter(models.Slot.floor_id == fid).all()]
+    old_slot_ids = [s.id for s in old_slots]
     if old_slot_ids:
         db.query(models.Level).filter(models.Level.slot_id.in_(old_slot_ids)).delete(synchronize_session=False)
     db.query(models.Slot).filter(models.Slot.floor_id == fid).delete()
     db.flush()
     n_slot = n_level = 0
     saved_keys = set()
+    new_levels = {}
     for key, st in data.slots.items():
         try:
             rr, cc = key.split(","); r, c = int(rr), int(cc)
@@ -96,14 +136,18 @@ def save_map(fid: int, data: MapSave, user: models.User = Depends(require_role("
         n_slot += 1
         for i, lv in enumerate(st.get("levels", []) if isinstance(st, dict) else []):
             img_path = _img_in(lv.get("img") if isinstance(lv, dict) else None)
-            db.add(models.Level(
-                slot_id=slot.id, level_index=i,
-                status_key=str(lv.get("s", "empty"))[:32] if isinstance(lv, dict) else "empty",
-                name=str(lv.get("name", ""))[:64] if isinstance(lv, dict) else "",
-                qty=max(0, int(lv.get("qty", 0) or 0)) if isinstance(lv, dict) else 0,
-                img_path=img_path,
-                note=str(lv.get("note", ""))[:500] if isinstance(lv, dict) else "",
-            ))
+            qty = max(0, int(lv.get("qty", 0) or 0)) if isinstance(lv, dict) else 0
+            sk = str(lv.get("s", "empty"))[:32] if isinstance(lv, dict) else "empty"
+            if qty <= 0:
+                sk = "empty"  # 数量为 0 自动置空状态
+            # 注意：qty 从 0 改为正数时不自动翻有货——整图保存分不清"用户手动设空"还是"没动过"，
+            # 自动翻会覆盖用户的手动选择；0→正数的自动翻转由前端 applyQtyStatus 和 MCP 单字段更新负责
+            norm = {"status_key": sk,
+                    "name": str(lv.get("name", ""))[:64] if isinstance(lv, dict) else "",
+                    "qty": qty, "img_path": img_path,
+                    "note": str(lv.get("note", ""))[:500] if isinstance(lv, dict) else ""}
+            new_levels[(r, c, i)] = norm
+            db.add(models.Level(slot_id=slot.id, level_index=i, **norm))
             n_level += 1
     n_group = 0
     if data.groups is not None:
@@ -125,8 +169,27 @@ def save_map(fid: int, data: MapSave, user: models.User = Depends(require_role("
             db.add(models.SlotGroup(floor_id=fid, name=name, members=_json.dumps(members),
                                     sort_order=order))
             n_group += 1
+    # 新旧 diff：只记真正的改动
+    changes = []
+    old_slot_keys = {(r, c) for (r, c, _i) in old_levels}
+    new_slot_keys = {(r, c) for (r, c, _i) in new_levels}
+    for (r, c) in sorted(new_slot_keys - old_slot_keys):
+        changes.append(f"新增库位 {_code(r, c)}")
+    for (r, c) in sorted(old_slot_keys - new_slot_keys):
+        changes.append(f"删除库位 {_code(r, c)}")
+    for key in sorted(set(old_levels) & set(new_levels)):
+        r, c, i = key
+        d = _level_diff(db, wid, _code(r, c), i, old_levels[key], new_levels[key])
+        if d:
+            changes.append(d)
+    if n_group != old_n_group:
+        changes.append(f"编组 {old_n_group}→{n_group}")
     db.commit()
-    log_op(db, user.id, "map.save", f"保存楼层{fid}地图：{n_slot}库位/{n_level}层级/{n_group}编组")
+    if changes:
+        detail = f"保存楼层「{f.name}」地图：" + "；".join(changes[:12])
+        if len(changes) > 12:
+            detail += f"（等共 {len(changes)} 处改动）"
+        log_op(db, user.id, "map.save", detail)
     return {"ok": True, "slots": n_slot, "levels": n_level, "groups": n_group}
 
 @router.get("/warehouses/{wid}/export")
