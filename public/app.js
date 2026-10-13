@@ -1,0 +1,1888 @@
+const LS_KEY = 'wms_map_prototype_v1';
+const DATA_VERSION = 2;
+const BACKUP_KEY = 'wms_map_prototype_autobackup_v1';
+const BACKUP_PREV_KEY = 'wms_map_prototype_autobackup_prev_v1';
+const UNDO_LIMIT = 30;
+
+// ===== 后端 API（session 方案：浏览器自动带 cookie，前端不管 token） =====
+const API = {
+  warehouseId: null,
+  floorIdMap: {},
+  online: false,
+  async req(method, path, body, isForm) {
+    const headers = {};
+    const opts = { method, headers, credentials: 'same-origin' };
+    if (body) {
+      if (isForm) opts.body = body;
+      else { headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
+    }
+    const res = await fetch(path, opts);
+    if (res.status === 401) { const e = new Error('未登录'); e.code = 401; throw e; }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || ('请求失败 ' + res.status));
+    return data;
+  },
+  get: (p) => API.req('GET', p),
+  post: (p, b) => API.req('POST', p, b),
+  put: (p, b) => API.req('PUT', p, b),
+  del: (p) => API.req('DELETE', p),
+};
+function showLogin() { document.getElementById('loginOverlay').style.display = 'flex'; }
+function hideLogin() { document.getElementById('loginOverlay').style.display = 'none'; }
+async function doLogin() {
+  const u = document.getElementById('loginUser').value.trim();
+  const p = document.getElementById('loginPass').value;
+  if (!u || !p) { document.getElementById('loginTip').textContent = '请输入用户名和密码'; return; }
+  try {
+    const d = await API.post('/api/auth/login', { username: u, password: p });
+    localStorage.setItem('wms_user', JSON.stringify(d.user));
+    hideLogin();
+    await bootFromServer();
+  } catch (e) { document.getElementById('loginTip').textContent = e.message; }
+}
+async function bootFromServer() {
+  let whs = (await API.get('/api/warehouses')).warehouses;
+  if (!whs.length) whs = [(await API.post('/api/warehouses', { name: '默认仓库' })).warehouse];
+  API.warehouseId = whs[0].id;
+  const stData = await API.get(`/api/warehouses/${API.warehouseId}/statuses`);
+  let floors = (await API.get(`/api/warehouses/${API.warehouseId}/floors`)).floors;
+  if (!floors.length) floors = [(await API.post(`/api/warehouses/${API.warehouseId}/floors`, { name: '1F', rows: 8, cols: 14 })).floor];
+  API.floorIdMap = {};
+  const stateFloors = [];
+  for (let i = 0; i < floors.length; i++) {
+    const f = floors[i];
+    API.floorIdMap[i] = f.id;
+    const map = await API.get(`/api/floors/${f.id}/map`);
+    stateFloors.push({ name: f.name, rows: f.rows, cols: f.cols, slots: map.slots || {},
+      zones: (map.zones || []).map(z => ({ id: z.id, name: z.name, r0: z.r0, c0: z.c0, r1: z.r1, c1: z.c1 })),
+      groups: (map.groups || []).map(g => ({ id: String(g.id), name: g.name, members: g.members })) });
+  }
+  state = { version: DATA_VERSION, floors: stateFloors, active: 0, zoom: 1,
+    statuses: stData.statuses.map(s => ({ id: s.key, name: s.name, color: s.color, builtin: !!s.builtin })),
+    defLevels: 3 };
+  API.online = true;
+  normalizeState();
+  lastSavedJson = JSON.stringify(state);
+  save({ record: false, skipSync: true });
+  try {
+    const u = JSON.parse(localStorage.getItem('wms_user') || '{}');
+    if (u.username) {
+      document.getElementById('userLabel').textContent = u.username + '（' + (u.role === 'admin' ? '管理员' : u.role === 'operator' ? '操作员' : '查看者') + '）';
+      document.getElementById('logoutBtn').style.display = '';
+    }
+  } catch (e) {}
+  render();
+}
+let syncTimer = null;
+async function pushMapNow() {
+  clearTimeout(syncTimer);
+  if (!API.online) return;
+  try {
+    const idx = state.active;
+    const fid = API.floorIdMap[idx];
+    if (!fid) return;
+    await API.put(`/api/floors/${fid}/map`, { slots: state.floors[idx].slots, groups: state.floors[idx].groups || [] });
+  } catch (e) { console.warn('[sync]', e.message); }
+}
+function syncToServer() {
+  if (!API.online) return;
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(pushMapNow, 1500);
+}
+async function logout() {
+  try { await API.post('/api/auth/logout'); } catch (e) {}
+  API.online = false;
+  localStorage.removeItem('wms_user');
+  document.getElementById('userLabel').textContent = '';
+  document.getElementById('logoutBtn').style.display = 'none';
+  showLogin();
+}
+
+let state = null;
+let undoStack = [];
+let lastSavedJson = '';
+let suppressHistory = false;
+function defaultStatuses() {
+  return [
+    { id: 'empty', name: '空', color: '#e2e8f0', builtin: true },
+    { id: 'full', name: '有货', color: '#bbf7d0', builtin: true },
+    { id: 'in', name: '入库中', color: '#bfdbfe', builtin: true },
+    { id: 'locked', name: '锁定', color: '#fecaca', builtin: true },
+  ];
+}
+function defaultState() {
+  return { version: DATA_VERSION, floors: [demoFloor()], active: 0, zoom: 1, statuses: defaultStatuses(), defLevels: 3 };
+}
+const statusOf = id => (state.statuses.find(s => s.id === id) || state.statuses[0]);
+function textOn(hex) {
+  const c = String(hex || '#888888').replace('#', '');
+  const r = parseInt(c.substr(0, 2), 16), g = parseInt(c.substr(2, 2), 16), b = parseInt(c.substr(4, 2), 16);
+  return (r * 0.299 + g * 0.587 + b * 0.114) > 150 ? '#334155' : '#f8fafc';
+}
+const blankLevel = (s = 'empty') => ({ s, name: '', qty: 0, img: null, note: '' });
+// 单文件演示素材：不用外链，发出 HTML 后在没有本地数据的设备上也能直接展示。
+function demoAsset(bg, accent, kind) {
+  const art = {
+    carton: `<rect x="58" y="46" width="92" height="78" rx="8" fill="#d8a26a"/><path d="M58 60h92M104 46v78" stroke="#9a612f" stroke-width="5"/><path d="M82 78h44v29H82z" fill="#f8e2bf"/><path d="M90 89h28" stroke="#b8793c" stroke-width="4"/>`,
+    drink: `<g><rect x="54" y="55" width="31" height="75" rx="10" fill="#60a5fa"/><rect x="61" y="43" width="17" height="18" rx="4" fill="#2563eb"/><path d="M59 83h21" stroke="#dbeafe" stroke-width="6"/><rect x="103" y="47" width="31" height="83" rx="10" fill="#34d399"/><rect x="110" y="35" width="17" height="18" rx="4" fill="#059669"/><path d="M108 78h21" stroke="#d1fae5" stroke-width="6"/></g>`,
+    office: `<rect x="48" y="48" width="111" height="74" rx="8" fill="#f8fafc" stroke="#64748b" stroke-width="5"/><path d="M48 69h111M76 48v74" stroke="#94a3b8" stroke-width="4"/><path d="M92 83h43M92 99h33" stroke="#3b82f6" stroke-width="6" stroke-linecap="round"/><path d="M62 84h8M62 100h8" stroke="#f59e0b" stroke-width="7" stroke-linecap="round"/>`,
+    device: `<rect x="48" y="45" width="116" height="83" rx="12" fill="#334155"/><rect x="60" y="57" width="92" height="53" rx="6" fill="#93c5fd"/><path d="M82 128h49M98 128v10h18v-10" stroke="#64748b" stroke-width="7" stroke-linecap="round"/><circle cx="105" cy="83" r="12" fill="#dbeafe"/>`,
+    clean: `<path d="M82 47h34l6 18v62H76V65z" fill="#a7f3d0" stroke="#047857" stroke-width="5"/><path d="M88 47v-14h25v14" fill="#34d399" stroke="#047857" stroke-width="5"/><path d="M78 83h44" stroke="#ecfdf5" stroke-width="10"/><path d="M90 99h19" stroke="#047857" stroke-width="5" stroke-linecap="round"/>`,
+    package: `<rect x="45" y="72" width="58" height="54" rx="5" fill="#eab308"/><rect x="100" y="57" width="59" height="69" rx="5" fill="#f59e0b"/><path d="M45 87h58M100 75h59M74 72v54M129 57v69" stroke="#a16207" stroke-width="4"/><path d="M113 89h32" stroke="#fffbeb" stroke-width="6"/>`
+  }[kind] || '';
+  return 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="300" height="180" viewBox="0 0 300 180"><rect width="300" height="180" rx="22" fill="${bg}"/><circle cx="243" cy="38" r="23" fill="${accent}" opacity=".18"/><path d="M25 139h250" stroke="${accent}" stroke-width="5" stroke-linecap="round" opacity=".35"/>${art}</svg>`);
+}
+const DEMO_IMAGES = {
+  carton: demoAsset('#fff7ed', '#c2410c', 'carton'),
+  drink: demoAsset('#eff6ff', '#2563eb', 'drink'),
+  office: demoAsset('#f8fafc', '#475569', 'office'),
+  device: demoAsset('#eef2ff', '#4f46e5', 'device'),
+  clean: demoAsset('#ecfdf5', '#047857', 'clean'),
+  package: demoAsset('#fefce8', '#a16207', 'package')
+};
+function demoLevel(name, qty, img, s = 'full') {
+  return { s, name, qty, img: DEMO_IMAGES[img] || null };
+}
+function demoSlot(...levels) { return { levels }; }
+function demoFloor() {
+  return {
+    name: '1F · 演示仓', rows: 8, cols: 14,
+    zones: [
+      { id: 'demo-a', name: 'A区 · 快消品', r0: 0, c0: 0, r1: 2, c1: 5, color: '#2563eb' },
+      { id: 'demo-b', name: 'B区 · 办公用品', r0: 0, c0: 7, r1: 3, c1: 13, color: '#7c3aed' },
+      { id: 'demo-c', name: 'C区 · 设备备件', r0: 4, c0: 0, r1: 7, c1: 6, color: '#059669' },
+      { id: 'demo-d', name: 'D区 · 包材', r0: 5, c0: 8, r1: 7, c1: 13, color: '#d97706' }
+    ],
+    slots: {
+      '0,0': demoSlot(demoLevel('饮料整箱', 48, 'drink'), demoLevel('纸箱补货', 12, 'carton')),
+      '0,2': demoSlot(demoLevel('矿泉水', 36, 'drink')),
+      '1,1': demoSlot(demoLevel('纸箱', 80, 'carton')),
+      '2,4': demoSlot(demoLevel('办公文具', 26, 'office'), demoLevel('标签纸', 18, 'office')),
+      '0,8': demoSlot(demoLevel('办公耗材', 42, 'office')),
+      '1,10': demoSlot(demoLevel('显示设备', 8, 'device')),
+      '3,12': demoSlot(demoLevel('扫描设备', 5, 'device'), demoLevel('备件盒', 14, 'carton')),
+      '4,1': demoSlot(demoLevel('清洁用品', 22, 'clean')),
+      '5,4': demoSlot(demoLevel('消毒液', 15, 'clean')),
+      '6,6': demoSlot(demoLevel('胶带与缠膜', 64, 'package')),
+      '5,9': demoSlot(demoLevel('包装材料', 120, 'package')),
+      '7,12': demoSlot(demoLevel('快递纸箱', 90, 'carton'))
+    }
+  };
+}
+// 数量为 0 时自动把状态置空；状态不再自动变为"有货"，完全由用户手动控制
+function touchLevel(L) {
+  if ((L.qty || 0) <= 0) L.s = 'empty';
+  return L;
+}
+// 改数量时联动状态：改成 0→空；从 0 改成正数且状态为空→有货
+function applyQtyStatus(L, oldQty) {
+  if ((L.qty || 0) <= 0) L.s = 'empty';
+  else if ((oldQty || 0) <= 0 && L.s === 'empty') L.s = 'full';
+}
+function normalizeState() {
+  if (!state || !state.floors) state = defaultState();
+  if (!Array.isArray(state.statuses) || !state.statuses.length) state.statuses = defaultStatuses();
+  state.version = DATA_VERSION;
+  state.statuses.forEach(s => { if (!s.color) s.color = '#e2e8f0'; });
+  if (!state.defLevels) state.defLevels = 3;
+  state.floors.forEach(fl => {
+    if (!Array.isArray(fl.zones)) fl.zones = [];
+    // 兼容早期区域数据：早期演示数据曾使用 r1/c1 + r2/c2，旧数据也可能没有 id。
+    fl.zones = fl.zones.map((z, i) => {
+      z = z && typeof z === 'object' ? z : {};
+      const hasNewCoords = Object.prototype.hasOwnProperty.call(z, 'r0') || Object.prototype.hasOwnProperty.call(z, 'c0');
+      const r0 = Math.max(0, Math.floor(Number(hasNewCoords ? z.r0 : z.r1) || 0));
+      const c0 = Math.max(0, Math.floor(Number(hasNewCoords ? z.c0 : z.c1) || 0));
+      const r1 = Math.max(r0, Math.floor(Number(hasNewCoords ? z.r1 : z.r2) || r0));
+      const c1 = Math.max(c0, Math.floor(Number(hasNewCoords ? z.c1 : z.c2) || c0));
+      return { ...z, id: String(z.id || ('z' + (i + 1))), name: String(z.name || ('区域' + (i + 1))).slice(0, 12), r0, c0, r1, c1 };
+    });
+    if (!Array.isArray(fl.groups)) fl.groups = [];
+    // 编组规范化：成员只保留存在的库位，一个库位只进一个组（前组优先），空组丢弃
+    const claimedG = new Set();
+    fl.groups = fl.groups.map((g, i) => {
+      g = g && typeof g === 'object' ? g : {};
+      const members = [...new Set((Array.isArray(g.members) ? g.members : []).map(String)
+        .filter(k => fl.slots[k] && !claimedG.has(k)))];
+      members.forEach(k => claimedG.add(k));
+      return { id: String(g.id || ('g' + (i + 1))), name: String(g.name || '未命名架').slice(0, 24), members };
+    }).filter(g => g.members.length);
+    Object.keys(fl.slots).forEach(k => { fl.slots[k] = normSlot(fl.slots[k]); });
+  });
+  state.active = Math.max(0, Math.min(state.floors.length - 1, +state.active || 0));
+  activeZone = null; basePx = 0;
+  zoom = Math.max(0.25, Math.min(4, +state.zoom || 1));
+  state.zoom = zoom;
+}
+async function load() {
+  try {
+    const me = await API.get('/api/auth/me');
+    myRole = me && me.user ? me.user.role : null;
+    await bootFromServer();
+    return;
+  } catch (e) {
+    if (e.code === 401) { showLogin(); throw e; }
+    console.warn('[load] 服务器不可用，使用本地缓存:', e.message);
+    API.online = false;
+  }
+  try { const raw = localStorage.getItem(LS_KEY); if (raw) state = JSON.parse(raw); } catch (e) {}
+  normalizeState();
+  lastSavedJson = JSON.stringify(state);
+}
+function save(options = {}) {
+  if (!state) return;
+  state.version = DATA_VERSION;
+  const raw = JSON.stringify(state);
+  try {
+    if (options.record !== false && !suppressHistory && lastSavedJson && raw !== lastSavedJson) {
+      undoStack.push(lastSavedJson);
+      if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+      localStorage.setItem(BACKUP_PREV_KEY, JSON.stringify({ savedAt: Date.now(), state: lastSavedJson }));
+    }
+    localStorage.setItem(LS_KEY, raw);
+    localStorage.setItem(BACKUP_KEY, JSON.stringify({ savedAt: Date.now(), state: raw }));
+    lastSavedJson = raw;
+  } catch (e) {}
+  refreshHistoryUI();
+  if (!options.skipSync) syncToServer();
+}
+function refreshHistoryUI() {
+  const undoBtn = document.getElementById('undoBtn');
+  if (undoBtn) undoBtn.disabled = undoStack.length === 0;
+  const restoreBtn = document.getElementById('restoreBtn');
+  if (restoreBtn) restoreBtn.disabled = !localStorage.getItem(BACKUP_PREV_KEY);
+}
+function applyRawState(raw) {
+  try {
+    const next = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    state = next;
+    normalizeState();
+    suppressHistory = true;
+    render();
+    suppressHistory = false;
+    save({ record: false });
+    return true;
+  } catch (e) {
+    suppressHistory = false;
+    toast('恢复数据失败');
+    return false;
+  }
+}
+function undoLast() {
+  const raw = undoStack.pop();
+  if (!raw) { refreshHistoryUI(); return; }
+  applyRawState(raw);
+  toast('已撤销最近一次修改');
+}
+function restoreBackup() {
+  try {
+    const backup = JSON.parse(localStorage.getItem(BACKUP_PREV_KEY) || '');
+    if (!backup || !backup.state) { toast('暂无可恢复的自动备份'); return; }
+    if (lastSavedJson) {
+      undoStack.push(lastSavedJson);
+      if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+    }
+    if (applyRawState(backup.state)) { refreshHistoryUI(); toast('已恢复自动备份'); }
+  } catch (e) { toast('自动备份不可用'); }
+}
+const floor = () => state.floors[state.active];
+const code = (r, c) => String.fromCharCode(65 + r) + '-' + String(c + 1).padStart(2, '0');
+const esc = s => String(s).replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
+function normLevel(l) {
+  const ok = v => state.statuses.some(s => s.id === v);
+  const goodImg = v => (typeof v === 'string' && (v.startsWith('data:image') || v.startsWith('idb:') || v.startsWith('/uploads/') || v.startsWith('blob:') || /^https?:\/\//.test(v))) ? v : null;
+  if (l && typeof l === 'object') return touchLevel({ s: ok(l.s) ? l.s : 'empty', name: String(l.name || '').slice(0, 40), qty: Math.max(0, Math.floor(+l.qty || 0)), img: goodImg(l.img), note: String(l.note || '').slice(0, 200) });
+  return blankLevel(typeof l === 'string' && ok(l) ? l : 'empty');
+}
+function normSlot(v) {
+  if (v && typeof v === 'object' && Array.isArray(v.levels) && v.levels.length) return { levels: v.levels.map(normLevel) };
+  return { levels: [normLevel(v)] }; // v0.4 单层对象 / 更早的字符串格式
+}
+
+// 图片放入 IndexedDB，localStorage 只保存 idb:key，避免照片把本地数据撑爆。
+const IMAGE_DB_NAME = 'wms_map_images_v1';
+const IMAGE_STORE = 'images';
+let imageDbPromise = null;
+const imageUrlCache = new Map();
+function openImageDb() {
+  if (!window.indexedDB) return Promise.resolve(null);
+  if (imageDbPromise) return imageDbPromise;
+  imageDbPromise = new Promise(resolve => {
+    try {
+      const req = indexedDB.open(IMAGE_DB_NAME, 1);
+      req.onupgradeneeded = () => req.result.createObjectStore(IMAGE_STORE);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(null);
+    } catch (e) { resolve(null); }
+  });
+  return imageDbPromise;
+}
+function imageSrc(ref) {
+  if (!ref) return '';
+  if (String(ref).startsWith('data:image')) return ref;
+  if (String(ref).startsWith('/uploads/')) return ref;
+  if (String(ref).startsWith('blob:')) return ref;
+  if (/^https?:\/\//.test(String(ref))) return ref; // 外链图片直接用 URL
+  return imageUrlCache.get(ref) || '';
+}
+function putImageBlob(blob) {
+  return openImageDb().then(db => new Promise(resolve => {
+    if (!db || !blob) { resolve(null); return; }
+    const key = Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+    try {
+      const tx = db.transaction(IMAGE_STORE, 'readwrite');
+      tx.objectStore(IMAGE_STORE).put(blob, key);
+      tx.oncomplete = () => resolve('idb:' + key);
+      tx.onerror = () => resolve(null);
+    } catch (e) { resolve(null); }
+  }));
+}
+function getImageBlob(ref) {
+  const key = String(ref || '').replace(/^idb:/, '');
+  return openImageDb().then(db => new Promise(resolve => {
+    if (!db || !key) { resolve(null); return; }
+    try {
+      const req = db.transaction(IMAGE_STORE, 'readonly').objectStore(IMAGE_STORE).get(key);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => resolve(null);
+    } catch (e) { resolve(null); }
+  }));
+}
+function deleteImageRef(ref) {
+  if (!String(ref || '').startsWith('idb:')) return;
+  const key = String(ref).replace(/^idb:/, '');
+  const oldUrl = imageUrlCache.get(ref);
+  if (oldUrl) { URL.revokeObjectURL(oldUrl); imageUrlCache.delete(ref); }
+  openImageDb().then(db => {
+    if (!db || !key) return;
+    try { db.transaction(IMAGE_STORE, 'readwrite').objectStore(IMAGE_STORE).delete(key); } catch (e) {}
+  });
+}
+async function hydrateImages() {
+  const refs = new Set();
+  state.floors.forEach(fl => Object.values(fl.slots).forEach(st => st.levels.forEach(L => { if (String(L.img || '').startsWith('idb:')) refs.add(L.img); })));
+  await Promise.all([...refs].map(async ref => {
+    const blob = await getImageBlob(ref);
+    if (blob) imageUrlCache.set(ref, URL.createObjectURL(blob));
+  }));
+}
+async function migrateLegacyImages() {
+  let changed = false;
+  for (const fl of state.floors) for (const st of Object.values(fl.slots)) for (const L of st.levels) {
+    if (!String(L.img || '').startsWith('data:image')) continue;
+    try {
+      const blob = await (await fetch(L.img)).blob();
+      const ref = await putImageBlob(blob);
+      if (ref) { L.img = ref; changed = true; }
+    } catch (e) {}
+  }
+  if (changed) { save({ record: false }); await hydrateImages(); render(); }
+}
+
+const gridEl = document.getElementById('grid');
+const gridWrapEl = document.getElementById('gridWrap');
+const floorTabs = document.getElementById('floorTabs');
+let mode = 'pan';
+let painting = false, paintValue = true;
+let downPos = null, downCell = null;
+let pendingSheet = false;
+let zoom = 1;
+let shelfFilter = 'all';
+let listFilter = 'all';
+let listQuery = '';
+
+function render() {
+  renderTabs(); renderMapSummary(); renderGrid(); renderShelfOverview(); renderList(); renderStats(); renderLegend(); syncPaintStatus(); renderZoneBar(); save();
+}
+
+function renderTabs() {
+  floorTabs.innerHTML = '';
+  state.floors.forEach((f, i) => {
+    const b = document.createElement('button');
+    b.className = 'floor-tab' + (i === state.active ? ' active' : '');
+    b.textContent = f.name;
+    b.onclick = () => { state.active = i; activeZone = null; basePx = 0; syncSizeInputs(); render(); };
+    floorTabs.appendChild(b);
+  });
+  document.getElementById('floorName').value = floor().name;
+  document.getElementById('listFloor').textContent = '· ' + floor().name;
+}
+
+function renderMapSummary() {
+  const box = document.getElementById('mapSummary');
+  const isShelf = document.body.classList.contains('mode3d');
+  if (!box) return;
+  box.hidden = isShelf;
+  if (isShelf) { box.innerHTML = ''; return; }
+  const f = floor();
+  const total = f.rows * f.cols;
+  const created = Object.keys(f.slots).length;
+  const goods = Object.values(f.slots).filter(st => st.levels.some(levelHasGoods)).length;
+  const available = Math.max(0, total - created);
+  box.innerHTML = `<div><span class="map-summary-title">${esc(f.name)} · 平面地图</span><span class="map-summary-sub">${f.rows} 行 × ${f.cols} 列</span></div><div class="map-summary-items"><span class="map-summary-item">总位置 <b>${total}</b></span><span class="map-summary-item">已建库位 <b>${created}</b></span><span class="map-summary-item">有货 <b>${goods}</b></span><span class="map-summary-item">未建 <b>${available}</b></span></div>`;
+}
+
+function renderGrid() {
+  const f = floor();
+  const px = applyZoom();
+  gridEl.style.gridTemplateColumns = `repeat(${f.cols}, var(--cell))`;
+  // 宽度交给 CSS 的 max-content + min-width:100% 管理，避免放大地图撑开页面布局。
+  gridEl.style.width = '';
+  gridEl.innerHTML = '';
+  const isShelf = document.body.classList.contains('mode3d');
+  const showLabel = px >= 36 || isShelf;
+  // 货架视图默认保留完整行列，空库位也显示；需要聚焦时可切换为“仅看已使用”。
+  for (let r = 0; r < f.rows; r++) {
+    for (let c = 0; c < f.cols; c++) {
+      const key = r + ',' + c;
+      const st = f.slots[key];
+      if (isShelf && shelfFilter === 'occupied' && !st) continue;
+      const d = document.createElement('div');
+      const inGrp = !!groupOfKey(f, key);
+      const isSel = (batchOp && batchOp.selected.has(key)) || (groupOp && groupOp.selected.has(key));
+      d.className = 'cell' + (isShelf && !st ? ' shelf-empty' : '') + (inGrp ? ' in-group' : '') + (isSel ? ' batch-sel' : '');
+      d.dataset.r = r; d.dataset.c = c;
+      d.dataset.code = code(r, c);
+      if (st) {
+        const bands = st.levels.map((L, i) => {
+          const so = statusOf(L.s);
+          const src = imageSrc(L.img);
+          const has = levelHasGoods(L);
+          const hasImg = has && !!src;
+          const bg = hasImg ? `background-image:url("${src}")` : `background:${so.color || '#e2e8f0'}`;
+          // 货架视图：每层显示照片+名称+数量，状态用左边框颜色；数量为 0 按空显示
+          if (isShelf) {
+            const photo = hasImg ? `<div class="lvl-photo"><img src="${src}" alt=""></div>` : `<div class="lvl-photo"></div>`;
+            const nm = (has && L.name) ? esc(L.name) : '<span style="color:#94a3b8">（空）</span>';
+            const qty = has ? ` ×${L.qty}` : '';
+            const note = (has && L.note) ? `<div class="lvl-note">📝 ${esc(L.note)}</div>` : '';
+            return `<div class="band" style="--sc:${so.color || '#e2e8f0'}">${photo}<div class="lvl-info"><div class="lvl-name">${i + 1}·${nm}</div><div class="lvl-qty">${so.name}${qty}</div>${note}</div></div>`;
+          }
+          let label = '';
+          if (showLabel) {
+            const txt = has ? (L.name || ('×' + L.qty)) : '';
+            if (txt) {
+              const fs = Math.max(10, Math.round(px * 0.18));
+              label = `<span class="band-txt" style="font-size:${fs}px">${i + 1}·${esc(txt)}</span>`;
+            }
+          }
+          return `<div class="band" style="${bg};--lv:${i}">${label}</div>`;
+        }).join('');
+        const codeStr = code(r, c);
+        const tq = st.levels.reduce((a, L) => a + (L.qty || 0), 0);
+        if (isShelf) {
+          const filled = st.levels.filter(levelHasGoods).length;
+          const primary = st.levels.find(levelHasGoods) || st.levels[0];
+          const badgeText = filled ? `${filled}/${st.levels.length}层` : '已建位';
+          const badgeColor = primary ? (statusOf(primary.s).color || '#e2e8f0') : '#e2e8f0';
+          const grpObj = groupOfKey(f, key);
+          const gBadge = grpObj ? `<span class="shelf-badge" style="background:#e0f2fe;color:#0369a1">${esc(grpObj.name)}</span>` : '';
+          d.innerHTML = `<div class="shelf-code"><span>${codeStr}</span><span class="shelf-pos">第${r + 1}行 · 第${c + 1}列</span>${gBadge}<span class="shelf-badge" style="background:${badgeColor}">${badgeText}</span></div><div class="bands">${bands}</div>`;
+        } else {
+          d.innerHTML = `<div class="bands">${bands}</div>` + (tq > 0 ? `<span class="cqty">×${tq}</span>` : '');
+          // 小格子放不下全名时，中央显示首个有货层级的首字，一眼知道这是什么货
+          if (!showLabel) {
+            const named = st.levels.find(L => levelHasGoods(L) && L.name);
+            if (named) d.innerHTML += `<span class="cchar">${esc(named.name[0])}</span>`;
+          }
+        }
+        const lvTxt = st.levels.map((L, i) => levelHasGoods(L) ? `层${i + 1}:${statusOf(L.s).name}${L.name ? '(' + L.name + ')' : ''}×${L.qty}` : `层${i + 1}:空`).join(' ');
+        d.title = code(r, c) + ' ' + lvTxt;
+      } else {
+        if (isShelf) {
+          d.innerHTML = `<div class="shelf-code"><span>${code(r, c)}</span><span class="shelf-pos">第${r + 1}行 · 第${c + 1}列</span><span class="shelf-badge">空</span></div><div class="shelf-empty-body">未建立库位</div>`;
+          d.title = `${code(r, c)} 空库位`;
+        } else {
+          d.title = '空地（绘制模式下点按绘制）';
+        }
+      }
+      gridEl.appendChild(d);
+    }
+  }
+  renderZones();
+  renderGroups();
+  gridEl.oncontextmenu = e => e.preventDefault();
+  syncTouchAction();
+}
+function renderShelfOverview() {
+  const box = document.getElementById('shelfOverview');
+  const isShelf = document.body.classList.contains('mode3d');
+  if (!box) return;
+  box.hidden = !isShelf;
+  if (!isShelf) { box.innerHTML = ''; return; }
+  const f = floor();
+  const total = f.rows * f.cols;
+  const occupied = Object.keys(f.slots).length;
+  const used = Object.values(f.slots).filter(st => st.levels.some(levelHasGoods)).length;
+  const qty = Object.values(f.slots).reduce((sum, st) => sum + st.levels.reduce((n, L) => n + (L.qty || 0), 0), 0);
+  box.innerHTML = `<div class="shelf-overview-head"><div><div class="shelf-overview-title">${esc(f.name)} · 货架总览</div><div class="shelf-overview-sub">共 ${f.rows} 行 × ${f.cols} 列，点击货架卡片可打开该库位详情</div></div><div class="shelf-view-filter"><button data-shelf-filter="all" class="${shelfFilter === 'all' ? 'active' : ''}">全部货架</button><button data-shelf-filter="occupied" class="${shelfFilter === 'occupied' ? 'active' : ''}">仅看已使用</button></div></div><div class="shelf-overview-stats"><span>总位置 <b>${total}</b></span><span>已建立 <b>${occupied}</b></span><span>有货 <b>${used}</b></span><span>总件数 <b>${qty}</b></span></div>`;
+  box.querySelectorAll('[data-shelf-filter]').forEach(btn => {
+    btn.onclick = () => { shelfFilter = btn.dataset.shelfFilter; render(); };
+  });
+}
+// 移动端查看/平移模式支持双指捏合；绘制和擦除模式保留单指操作语义。
+const touchPoints = new Map();
+let pinchState = null;
+let suppressTapUntil = 0;
+function distanceBetween(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+function startPinch() {
+  const pts = [...touchPoints.values()];
+  if (pts.length < 2) return;
+  const rect = gridWrapEl.getBoundingClientRect();
+  const cx = (pts[0].x + pts[1].x) / 2 - rect.left;
+  const cy = (pts[0].y + pts[1].y) / 2 - rect.top;
+  pinchState = { distance: distanceBetween(pts[0], pts[1]), zoom, anchorX: gridWrapEl.scrollLeft + cx, anchorY: gridWrapEl.scrollTop + cy, screenX: cx, screenY: cy };
+  gridEl.style.touchAction = 'none';
+  suppressTapUntil = Date.now() + 500;
+}
+function updatePinch() {
+  if (!pinchState || touchPoints.size < 2) return;
+  const pts = [...touchPoints.values()];
+  const ratio = distanceBetween(pts[0], pts[1]) / Math.max(1, pinchState.distance);
+  zoom = Math.max(0.25, Math.min(4, pinchState.zoom * ratio));
+  state.zoom = zoom;
+  applyZoom();
+  const scale = zoom / pinchState.zoom;
+  gridWrapEl.scrollLeft = Math.max(0, pinchState.anchorX * scale - pinchState.screenX);
+  gridWrapEl.scrollTop = Math.max(0, pinchState.anchorY * scale - pinchState.screenY);
+}
+function finishPinch() {
+  if (!pinchState) return;
+  pinchState = null;
+  suppressTapUntil = Date.now() + 350;
+  syncTouchAction();
+  renderGrid();
+  save();
+}
+gridWrapEl.addEventListener('pointerdown', e => {
+  if (e.pointerType !== 'touch' || zoneDrawing || document.body.classList.contains('mode3d') || (mode !== 'pan')) return;
+  touchPoints.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (touchPoints.size === 2) { startPinch(); e.preventDefault(); }
+});
+gridWrapEl.addEventListener('pointermove', e => {
+  if (!touchPoints.has(e.pointerId)) return;
+  touchPoints.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (pinchState) { updatePinch(); e.preventDefault(); }
+});
+gridWrapEl.addEventListener('pointerup', e => {
+  if (touchPoints.has(e.pointerId)) touchPoints.delete(e.pointerId);
+  if (pinchState && touchPoints.size < 2) finishPinch();
+});
+gridWrapEl.addEventListener('pointercancel', e => {
+  touchPoints.delete(e.pointerId);
+  if (pinchState && touchPoints.size < 2) finishPinch();
+});
+// 统一用 Pointer Events：桌面鼠标和手机触屏走同一套逻辑
+gridEl.addEventListener('pointerdown', e => {
+  const d0 = e.target.closest('.cell');
+  if (zoneDrawing) { // 区域框选优先于一切模式
+    if (!d0 || !gridEl.contains(d0)) return;
+    zoneAnchor = { r: +d0.dataset.r, c: +d0.dataset.c };
+    zoneRect = { ...zoneAnchor };
+    paintZoneRect();
+    e.preventDefault();
+    return;
+  }
+  const d = d0;
+  if (!d || !gridEl.contains(d)) return;
+  if (e.pointerType !== 'mouse') { try { d.releasePointerCapture(e.pointerId); } catch (_) {} }
+  downPos = { x: e.clientX, y: e.clientY };
+  downCell = d;
+  if (batchOp || groupOp) return; // 正在批量移动/复制或编组：不绘制、不开窗
+  if (mode === 'pan') return; // 平移：只读移动地图，不弹窗
+  if (mode === 'paint') {
+    const key = d.dataset.r + ',' + d.dataset.c;
+    const cur = floor().slots[key];
+    if (cur) { pendingSheet = true; return; }
+  }
+  pendingSheet = false;
+  painting = true; paintValue = (mode !== 'erase');
+  applyCell(d); e.preventDefault();
+});
+gridEl.addEventListener('pointermove', e => {
+  if (zoneDrawing) {
+    if (!zoneAnchor) return;
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    const d = el && el.closest ? el.closest('.cell') : null;
+    if (d && gridEl.contains(d)) { zoneRect = { r: +d.dataset.r, c: +d.dataset.c }; paintZoneRect(); }
+    return;
+  }
+  if (!painting) return;
+  const el = document.elementFromPoint(e.clientX, e.clientY);
+  const d = el && el.closest ? el.closest('.cell') : null;
+  if (d && gridEl.contains(d)) applyCell(d);
+});
+gridEl.addEventListener('pointerup', e => {
+  if (pinchState || Date.now() < suppressTapUntil) {
+    painting = false; pendingSheet = false; downPos = null; downCell = null;
+    return;
+  }
+  if (zoneDrawing) {
+    if (zoneAnchor && zoneRect) {
+      const r0 = Math.min(zoneAnchor.r, zoneRect.r), r1 = Math.max(zoneAnchor.r, zoneRect.r);
+      const c0 = Math.min(zoneAnchor.c, zoneRect.c), c1 = Math.max(zoneAnchor.c, zoneRect.c);
+      clearZoneRect();
+      zoneAnchor = zoneRect = null;
+      (async () => {
+        const name = await uiPrompt('新建区域', '区域' + (floor().zones.length + 1));
+        if (name) {
+          const zone = { id: 'z' + Date.now().toString(36), name: name.slice(0, 12), r0, c0, r1, c1 };
+          floor().zones.push(zone);
+          // 同步到服务器
+          const fid = API.floorIdMap[state.active];
+          if (API.online && fid) {
+            try {
+              const d = await API.post(`/api/floors/${fid}/zones`, { name: zone.name, r0, c0, r1, c1 });
+              zone.id = String(d.zone.id); // 换成服务器 ID
+            } catch (e) { console.warn('[addZone] 服务器同步失败:', e.message); }
+          }
+          render(); toast('区域已创建，点区域名可跳转');
+        }
+      })();
+    } else { zoneAnchor = zoneRect = null; }
+    return;
+  }
+  if (downCell && downPos && Math.hypot(e.clientX - downPos.x, e.clientY - downPos.y) < 12) {
+    if (batchOp) onBatchTap(downCell.dataset.r + ',' + downCell.dataset.c);
+    else if (groupOp) onGroupTap(downCell.dataset.r + ',' + downCell.dataset.c);
+    else if (pendingSheet) openSheet(downCell);
+  }
+  painting = false; pendingSheet = false; downPos = null; downCell = null;
+});
+gridEl.addEventListener('pointercancel', () => { painting = false; downPos = null; downCell = null; if (zoneDrawing) { zoneAnchor = zoneRect = null; clearZoneRect(); } });
+window.addEventListener('pointerup', () => { painting = false; });
+function syncTouchAction() {
+  // 区域框选/绘制/擦除：手指滑动=操作；查看/平移：允许滚动和双指捏合。
+  gridEl.style.touchAction = pinchState || zoneDrawing || mode === 'paint' || mode === 'erase' ? 'none' : 'pan-x pan-y';
+}
+// 地图缩放：基准格子尺寸只在楼层/行列/窗口变化时重算，绘制时不再测量，彻底断掉测量-绘制反馈环
+let basePx = 0;
+let cellPxNow = 40;
+function computeBasePx() {
+  const wrap = document.getElementById('gridWrap');
+  const fallback = Math.max(320, document.documentElement.clientWidth || window.innerWidth || 360);
+  const style = wrap ? getComputedStyle(wrap) : null;
+  const pad = style ? parseFloat(style.paddingLeft || 0) + parseFloat(style.paddingRight || 0) : 24;
+  const contentW = Math.max(1, (wrap && wrap.clientWidth ? wrap.clientWidth : fallback) - pad);
+  const cols = floor().cols;
+  return Math.max(8, Math.floor((contentW - (cols - 1) * 4) / cols));
+}
+function applyZoom() {
+  if (!basePx) basePx = computeBasePx();
+  const px = Math.round(Math.min(160, Math.max(10, basePx * zoom)));
+  cellPxNow = px;
+  if (state) state.zoom = zoom;
+  gridEl.style.setProperty('--cell', px + 'px');
+  gridEl.classList.toggle('tiny', px < 24);
+  const pct = document.getElementById('zoomPct');
+  if (pct) pct.textContent = Math.round(zoom * 100) + '%';
+  return px;
+}
+function setZoom(next) {
+  const wrap = document.getElementById('gridWrap');
+  const oldZoom = zoom;
+  const anchorX = wrap ? wrap.scrollLeft + wrap.clientWidth / 2 : 0;
+  const anchorY = wrap ? wrap.scrollTop + wrap.clientHeight / 2 : 0;
+  zoom = Math.max(0.25, Math.min(4, next));
+  state.zoom = zoom;
+  // 缩放只重绘地图层，不重建右侧清单、统计和工具栏，避免页面其它区域闪动或滚动位置被重置。
+  renderGrid();
+  save();
+  if (wrap && oldZoom !== zoom) requestAnimationFrame(() => {
+    const ratio = zoom / oldZoom;
+    wrap.scrollLeft = Math.max(0, anchorX * ratio - wrap.clientWidth / 2);
+    wrap.scrollTop = Math.max(0, anchorY * ratio - wrap.clientHeight / 2);
+  });
+}
+document.getElementById('zoomIn').onclick = () => setZoom(zoom * 1.25);
+document.getElementById('zoomOut').onclick = () => setZoom(zoom / 1.25);
+let resizeT = null;
+window.addEventListener('resize', () => {
+  basePx = 0; applyZoom(); // 先立刻更新格子尺寸
+  clearTimeout(resizeT);
+  resizeT = setTimeout(() => render(), 200); // 停稳后重渲染标签与区域
+});
+// 自绘弹窗（替代 prompt/confirm/alert，App 内嵌网页会屏蔽系统弹窗）
+const modalOverlay = document.getElementById('modalOverlay');
+const modalTitle = document.getElementById('modalTitle');
+const modalBody = document.getElementById('modalBody');
+const modalInput = document.getElementById('modalInput');
+const modalOk = document.getElementById('modalOk');
+const modalCancel = document.getElementById('modalCancel');
+function openModal(cb) {
+  modalOverlay.hidden = false;
+  const done = v => { modalOverlay.hidden = true; modalOk.onclick = modalCancel.onclick = null; modalOverlay.onclick = null; cb(v); };
+  modalOk.onclick = () => done(true);
+  modalCancel.onclick = () => done(false);
+  modalOverlay.onclick = e => { if (e.target === modalOverlay) done(false); };
+}
+function uiConfirm(title, msg) {
+  return new Promise(resolve => {
+    modalTitle.textContent = title; modalBody.textContent = msg;
+    modalInput.hidden = true; modalCancel.style.display = '';
+    openModal(resolve);
+  });
+}
+function uiPrompt(title, defVal) {
+  return new Promise(resolve => {
+    modalTitle.textContent = title; modalBody.textContent = '';
+    modalInput.hidden = false; modalInput.value = defVal || '';
+    modalCancel.style.display = '';
+    openModal(ok => resolve(ok ? modalInput.value.trim() : null));
+    setTimeout(() => { try { modalInput.focus(); } catch (_) {} }, 60);
+  });
+}
+let toastTimer = null;
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 1800);
+}
+// 货物详情（底部弹出层，按层级编辑）
+let sheetKey = null, sheetLevel = 0;
+const sheetOverlay = document.getElementById('sheetOverlay');
+const sheetCode = document.getElementById('sheetCode');
+const sheetName = document.getElementById('sheetName');
+const sheetQty = document.getElementById('sheetQty');
+const sheetPhotoWrap = document.getElementById('sheetPhotoWrap');
+const sheetImg = document.getElementById('sheetImg');
+const sheetFile = document.getElementById('sheetFile');
+const sheetDelImg = document.getElementById('sheetDelImg');
+const lvlTabs = document.getElementById('lvlTabs');
+const lvlCount = document.getElementById('lvlCount');
+// 输入框 change 里不能同步调 syncSheet：syncSheet 会重建状态按钮，
+// 若用户正要点某个按钮（输入框失焦先触发 change），按钮会在 click 到达前被销毁，
+// 导致这次点击丢失。延迟到当前事件队列之后再重建。
+let syncSheetTimer = 0;
+function syncSheetSoon() {
+  clearTimeout(syncSheetTimer);
+  syncSheetTimer = setTimeout(syncSheet, 0);
+}
+// 把编辑窗输入框的未提交值直接写回当前层级（切换层级/开关面板前必须调用）。
+// 不依赖 blur→change 的事件顺序，避免输入框的值被写到错误的层级上，
+// 导致数量/状态被意外改动（例如 1 层的状态被翻成有货）。
+function commitSheetInputs() {
+  const L = sheetLv(); if (!L) return;
+  const nameVal = sheetName.value.trim().slice(0, 40);
+  if (nameVal !== (L.name || '')) { L.name = nameVal; touchLevel(L); }
+  const qtyVal = Math.max(0, Math.floor(+sheetQty.value || 0));
+  if (qtyVal !== (L.qty || 0)) {
+    const oldQty = L.qty || 0;
+    L.qty = qtyVal;
+    applyQtyStatus(L, oldQty); touchLevel(L);
+  }
+  const noteEl = document.getElementById('sheetNote');
+  if (noteEl) {
+    const noteVal = noteEl.value.trim().slice(0, 200);
+    if (noteVal !== (L.note || '')) L.note = noteVal;
+  }
+  const ae = document.activeElement;
+  if (ae && (ae === sheetName || ae === sheetQty || ae === noteEl)) ae.blur();
+}
+function openSheet(d) {
+  commitSheetInputs();
+  const key = d.dataset.r + ',' + d.dataset.c;
+  if (!floor().slots[key]) return;
+  sheetKey = key; sheetLevel = 0;
+  let dock = 'bottom';
+  try { dock = localStorage.getItem('wms_sheet_dock') || 'bottom'; } catch (e) {}
+  applySheetDock(dock);
+  syncSheet();
+  sheetOverlay.hidden = false;
+}
+function closeSheet() { commitSheetInputs(); sheetOverlay.hidden = true; sheetKey = null; save(); }
+
+/* ===== 批量移动/复制（工具栏进入）：多选库位 → 点锚点整体平移 ===== */
+let batchOp = null; // { type:'move'|'copy', phase:'select'|'target', selected:Set<key> }
+const slotOpBar = document.getElementById('slotOpBar');
+const slotOpText = document.getElementById('slotOpText');
+const slotOpPrimary = document.getElementById('slotOpPrimary');
+
+// 纯计算：给定选中格与锚点，算出落点、冲突与要删的源格（可独立测试）
+function planBatchOp(slotsObj, keys, type, tR, tC, rows, cols) {
+  const sel = new Set(keys);
+  const pts = [...sel].map(k => k.split(',').map(Number)).filter(p => slotsObj[p[0] + ',' + p[1]]);
+  if (!pts.length) return { ok: false, reason: 'empty' };
+  const minR = Math.min(...pts.map(p => p[0])), minC = Math.min(...pts.map(p => p[1]));
+  const dr = tR - minR, dc = tC - minC;
+  const updates = {}, conflicts = [];
+  for (const [r, c] of pts) {
+    const nr = r + dr, nc = c + dc;
+    if (nr < 0 || nc < 0 || nr >= rows || nc >= cols) return { ok: false, reason: 'out_of_bounds' };
+    const nk = nr + ',' + nc;
+    if (slotsObj[nk] && !sel.has(nk)) conflicts.push(nk);
+    updates[nk] = JSON.parse(JSON.stringify(slotsObj[r + ',' + c]));
+  }
+  return { ok: true, updates, deletes: type === 'move' ? [...sel] : [], conflicts };
+}
+
+function updateBatchBar() {
+  if (!batchOp) { slotOpBar.hidden = true; slotOpDanger.hidden = true; return; }
+  slotOpBar.hidden = false;
+  const n = batchOp.selected.size;
+  const label = batchOp.type === 'move' ? '移动' : '复制';
+  if (batchOp.phase === 'select') {
+    slotOpText.textContent = '批量' + label + '：点格子多选（已选 ' + n + ' 个）';
+    slotOpPrimary.textContent = '去放（选目标点）';
+    slotOpPrimary.disabled = n === 0;
+    slotOpPrimary.style.opacity = n === 0 ? '.5' : '';
+  } else {
+    slotOpText.textContent = '点任意格子：把选区左上角放到这里';
+    slotOpPrimary.textContent = '返回重选';
+    slotOpPrimary.disabled = false;
+    slotOpPrimary.style.opacity = '';
+  }
+}
+function exitBatch(renderAfter = true) {
+  batchOp = null;
+  slotOpBar.hidden = true;
+  if (renderAfter) render();
+}
+function startBatchOp(type) {
+  if (sheetKey) closeSheet();
+  if (groupOp) exitGroup(false);
+  if (zoneDrawing) { zoneDrawing = false; zoneAnchor = zoneRect = null; clearZoneRect(); const zb = document.getElementById('zoneBtn'); if (zb) zb.classList.remove('active'); }
+  batchOp = { type, phase: 'select', selected: new Set() };
+  updateBatchBar(); render();
+  toast('点选要' + (type === 'move' ? '移动' : '复制') + '的库位，可多选');
+}
+slotOpPrimary.onclick = () => {
+  if (groupOp) { finishGroupOp(); return; }
+  if (!batchOp) return;
+  if (batchOp.phase === 'select') {
+    if (!batchOp.selected.size) { toast('还没选库位'); return; }
+    batchOp.phase = 'target';
+  } else batchOp.phase = 'select';
+  updateBatchBar();
+};
+document.getElementById('slotOpCancel').onclick = () => {
+  if (groupOp) { exitGroup(); toast('已取消'); return; }
+  exitBatch(); toast('已取消');
+};
+document.getElementById('batchMoveBtn').onclick = () => startBatchOp('move');
+document.getElementById('batchCopyBtn').onclick = () => startBatchOp('copy');
+
+function onBatchTap(key) {
+  if (!batchOp) return;
+  if (batchOp.phase === 'select') {
+    if (!floor().slots[key]) { toast('只能选已有库位的格子'); return; }
+    batchOp.selected.has(key) ? batchOp.selected.delete(key) : batchOp.selected.add(key);
+    render(); updateBatchBar();
+  } else {
+    const [r, c] = key.split(',').map(Number);
+    execBatch(r, c);
+  }
+}
+async function execBatch(tR, tC) {
+  const f = floor();
+  const plan = planBatchOp(f.slots, batchOp.selected, batchOp.type, tR, tC, f.rows, f.cols);
+  if (!plan.ok) { toast(plan.reason === 'out_of_bounds' ? '放不下：会超出网格范围' : '没有可操作的库位'); return; }
+  if (plan.conflicts.length) {
+    const ok = await uiConfirm(batchOp.type === 'move' ? '批量移动' : '批量复制', '落点处有 ' + plan.conflicts.length + ' 个已有库位会被覆盖，确定继续？');
+    if (!ok) return;
+  }
+  const n = batchOp.selected.size, type = batchOp.type;
+  plan.deletes.forEach(k => delete f.slots[k]);
+  Object.entries(plan.updates).forEach(([k, v]) => { f.slots[k] = v; });
+  if (type === 'move') translateGroupMembers(f, batchOp.selected, tR, tC);
+  // 被覆盖掉的目标格旧库位已销毁：其编组关系随旧库位一起消失
+  const destroyedG = plan.deletes.filter(k => !(type === 'move' && batchOp.selected.has(k)));
+  if (destroyedG.length) (f.groups || []).forEach(g => { g.members = g.members.filter(k => !destroyedG.includes(k)); });
+  pruneGroups(f);
+  exitBatch(false); render();
+  toast((type === 'move' ? '已移动 ' : '已复制 ') + n + ' 个库位');
+}
+
+/* ===== 库位编组：多个库位组成一个置物架 ===== */
+function groupOfKey(fl, key) {
+  return (fl.groups || []).find(g => g.members.includes(key)) || null;
+}
+function pruneGroups(fl) {
+  (fl.groups || []).forEach(g => { g.members = g.members.filter(k => fl.slots[k]); });
+  fl.groups = (fl.groups || []).filter(g => g.members.length);
+}
+function translateGroupMembers(fl, selectedKeys, tR, tC) {
+  const pts = [...selectedKeys].map(k => k.split(',').map(Number));
+  if (!pts.length) return;
+  const dr = tR - Math.min(...pts.map(p => p[0])), dc = tC - Math.min(...pts.map(p => p[1]));
+  const map = {};
+  pts.forEach(([r, c]) => { map[r + ',' + c] = (r + dr) + ',' + (c + dc); });
+  (fl.groups || []).forEach(g => {
+    g.members = [...new Set(g.members.map(k => map[k] || k))].filter(k => fl.slots[k]);
+  });
+}
+
+let groupOp = null; // { editId: string|null, selected: Set<key> }
+const slotOpDanger = document.getElementById('slotOpDanger');
+function updateGroupBar() {
+  if (!groupOp) { slotOpBar.hidden = true; slotOpDanger.hidden = true; return; }
+  slotOpBar.hidden = false;
+  slotOpDanger.hidden = !groupOp.editId;
+  const n = groupOp.selected.size;
+  slotOpText.textContent = (groupOp.editId ? '编辑编组：点格子增减成员' : '新建编组：点选同一置物架的库位') + '（已选 ' + n + ' 个）';
+  slotOpPrimary.textContent = groupOp.editId ? '保存（含改名）' : '下一步：命名';
+  slotOpPrimary.disabled = n === 0;
+  slotOpPrimary.style.opacity = n === 0 ? '.5' : '';
+}
+function exitGroup(renderAfter = true) {
+  groupOp = null; slotOpDanger.hidden = true;
+  slotOpBar.hidden = true;
+  if (renderAfter) render();
+}
+function startGroupOp(existing) {
+  if (sheetKey) closeSheet();
+  if (batchOp) exitBatch(false);
+  if (zoneDrawing) { zoneDrawing = false; zoneAnchor = zoneRect = null; clearZoneRect(); const zb = document.getElementById('zoneBtn'); if (zb) zb.classList.remove('active'); }
+  if (document.body.classList.contains('mode3d')) document.getElementById('view3dBtn').click();
+  groupOp = { editId: existing ? existing.id : null, selected: new Set(existing ? existing.members : []) };
+  updateGroupBar(); render();
+  toast(existing ? '编辑编组「' + existing.name + '」' : '点选要组成一个置物架的库位，可多选');
+}
+document.getElementById('groupBtn').onclick = () => startGroupOp(null);
+function onGroupTap(key) {
+  if (!groupOp) return;
+  const fl = floor();
+  if (!fl.slots[key]) { toast('只能选已有库位的格子'); return; }
+  const g = groupOfKey(fl, key);
+  if (g && g.id !== groupOp.editId) { toast('已在编组「' + g.name + '」里，先在那边移出'); return; }
+  groupOp.selected.has(key) ? groupOp.selected.delete(key) : groupOp.selected.add(key);
+  render(); updateGroupBar();
+}
+async function finishGroupOp() {
+  const fl = floor();
+  const members = [...groupOp.selected];
+  if (!members.length) { toast('还没选库位'); return; }
+  if (groupOp.editId) {
+    const g = fl.groups.find(x => x.id === groupOp.editId);
+    if (!g) { exitGroup(); return; }
+    const name = await uiPrompt('编组名称', g.name);
+    if (name === null) return;
+    if (!String(name).trim()) { toast('名字不能为空'); return; }
+    g.name = String(name).trim().slice(0, 24);
+    g.members = members;
+    pruneGroups(fl);
+    exitGroup(false); render();
+    toast('编组已保存');
+  } else {
+    const name = await uiPrompt('给这个置物架起个名字', '置物架' + ((fl.groups || []).length + 1));
+    if (name === null) return;
+    if (!String(name).trim()) { toast('名字不能为空'); return; }
+    fl.groups = fl.groups || [];
+    fl.groups.push({ id: 'g' + Date.now().toString(36), name: String(name).trim().slice(0, 24), members });
+    pruneGroups(fl);
+    exitGroup(false); render();
+    toast('已建编组「' + String(name).trim() + '」');
+  }
+}
+slotOpDanger.onclick = async () => {
+  if (!groupOp || !groupOp.editId) return;
+  const g = floor().groups.find(x => x.id === groupOp.editId);
+  if (!g) { exitGroup(); return; }
+  const ok = await uiConfirm('解散编组', '解散编组「' + g.name + '」吗？库位和货物不受影响。');
+  if (!ok) return;
+  floor().groups = floor().groups.filter(x => x.id !== groupOp.editId);
+  exitGroup(false); render();
+  toast('编组已解散');
+};
+
+/* ===== 编辑窗口拖动停靠：拖把手/标题栏移动，松手贴最近的边 ===== */
+const SHEET_DOCKS = ['bottom', 'top', 'left', 'right'];
+function applySheetDock(dock) {
+  if (!SHEET_DOCKS.includes(dock)) dock = 'bottom';
+  sheetOverlay.dataset.dock = dock;
+  const sheetEl = sheetOverlay.querySelector('.sheet');
+  sheetEl.style.position = ''; sheetEl.style.left = ''; sheetEl.style.top = '';
+  sheetEl.style.width = ''; sheetEl.style.height = ''; sheetEl.style.maxHeight = ''; sheetEl.style.margin = '';
+  try { localStorage.setItem('wms_sheet_dock', dock); } catch (e) {}
+}
+(function () {
+  const sheetEl = sheetOverlay.querySelector('.sheet');
+  const handles = [sheetEl.querySelector('.sheet-grab'), sheetEl.querySelector('.sheet-head')];
+  let drag = null;
+  function onDown(e) {
+    if (e.target.closest('button, input, textarea, select, label')) return;
+    const r = sheetEl.getBoundingClientRect();
+    drag = { x: e.clientX, y: e.clientY, dx: e.clientX - r.left, dy: e.clientY - r.top, w: r.width, h: r.height, moved: false };
+    try { e.target.setPointerCapture(e.pointerId); } catch (_) {}
+  }
+  function onMove(e) {
+    if (!drag) return;
+    if (!drag.moved && Math.hypot(e.clientX - drag.x, e.clientY - drag.y) < 7) return;
+    drag.moved = true;
+    sheetEl.style.position = 'fixed';
+    sheetEl.style.width = drag.w + 'px'; sheetEl.style.maxHeight = 'none'; sheetEl.style.margin = '0';
+    sheetEl.style.left = Math.max(-drag.w + 60, Math.min(window.innerWidth - 60, e.clientX - drag.dx)) + 'px';
+    sheetEl.style.top = Math.max(0, Math.min(window.innerHeight - 44, e.clientY - drag.dy)) + 'px';
+    sheetEl.style.zIndex = '1001';
+  }
+  function onUp(e) {
+    if (!drag) return;
+    const d = drag; drag = null;
+    if (!d.moved) return;
+    // 按窗口中心离四边的距离决定停靠边
+    const cx = e.clientX - d.dx + d.w / 2, cy = e.clientY - d.dy + d.h / 2;
+    const dist = { left: cx, right: window.innerWidth - cx, top: cy, bottom: window.innerHeight - cy };
+    const dock = Object.keys(dist).reduce((a, b) => dist[a] < dist[b] ? a : b);
+    applySheetDock(dock);
+    toast('窗口已停靠：' + ({ bottom: '底部', top: '顶部', left: '左侧', right: '右侧' }[dock]));
+  }
+  handles.forEach(el => { if (!el) return; el.addEventListener('pointerdown', onDown); el.addEventListener('pointermove', onMove); el.addEventListener('pointerup', onUp); el.addEventListener('pointercancel', onUp); });
+})();
+function sheetSlot() { return sheetKey ? floor().slots[sheetKey] : null; }
+function sheetLv() { const s = sheetSlot(); return s ? s.levels[Math.min(sheetLevel, s.levels.length - 1)] : null; }
+function syncSheet() {
+  const st = sheetSlot();
+  if (!st) { closeSheet(); return; }
+  sheetLevel = Math.max(0, Math.min(sheetLevel, st.levels.length - 1));
+  const L = st.levels[sheetLevel];
+  const [r, c] = sheetKey.split(',').map(Number);
+  sheetCode.textContent = '库位 ' + code(r, c) + (groupOfKey(floor(), sheetKey) ? ' · ' + groupOfKey(floor(), sheetKey).name : '');  lvlCount.textContent = st.levels.length + '层';
+  lvlTabs.innerHTML = '';
+  st.levels.forEach((lv, i) => {
+    const b = document.createElement('button');
+    b.className = 'lvl-tab' + (i === sheetLevel ? ' active' : '');
+    b.textContent = `层${i + 1}${lv.name ? ' ' + lv.name.slice(0, 6) : ''}${lv.note ? ' 📝' : ''}`;
+    b.style.borderLeft = `4px solid ${statusOf(lv.s).color}`;
+    b.onclick = () => { commitSheetInputs(); sheetLevel = i; syncSheet(); };
+    lvlTabs.appendChild(b);
+  });
+  if (document.activeElement !== sheetName) sheetName.value = L.name || '';
+  if (document.activeElement !== sheetQty) sheetQty.value = L.qty || 0;
+  const sheetNoteEl = document.getElementById('sheetNote');
+  if (sheetNoteEl && document.activeElement !== sheetNoteEl) sheetNoteEl.value = L.note || '';
+  const currentImgSrc = imageSrc(L.img);
+  sheetPhotoWrap.classList.toggle('has-img', !!currentImgSrc);
+  sheetImg.onerror = () => { console.warn('[img] 加载失败:', currentImgSrc); sheetImg.style.opacity = '0.3'; };
+  sheetImg.onload = () => { sheetImg.style.opacity = ''; };
+  sheetImg.src = currentImgSrc;
+  sheetDelImg.style.display = L.img ? '' : 'none';
+  const sp = document.getElementById('sheetStatus');
+  sp.innerHTML = '';
+  state.statuses.forEach(s => {
+    const b = document.createElement('button');
+    b.textContent = s.name;
+    if (s.id === L.s) b.classList.add('active');
+    b.onclick = () => { L.s = s.id; touchLevel(L); commitSheetInputs(); syncSheet(); render(); pushMapNow(); };
+    sp.appendChild(b);
+  });
+}
+document.getElementById('sheetClose').onclick = closeSheet;
+sheetOverlay.addEventListener('click', e => { if (e.target === sheetOverlay) closeSheet(); });
+document.getElementById('lvlMinus').onclick = async () => {
+  const st = sheetSlot(); if (!st) return;
+  if (st.levels.length <= 1) { toast('至少保留一层'); return; }
+  if (!(await uiConfirm('删除层级', `删除第 ${sheetLevel + 1} 层及其货物信息吗？`))) return;
+  commitSheetInputs();
+  st.levels.splice(sheetLevel, 1);
+  sheetLevel = Math.max(0, sheetLevel - 1);
+  syncSheet(); render();
+};
+document.getElementById('lvlPlus').onclick = () => {
+  const st = sheetSlot(); if (!st) return;
+  if (st.levels.length >= 12) { toast('最多 12 层'); return; }
+  commitSheetInputs();
+  st.levels.push(blankLevel());
+  sheetLevel = st.levels.length - 1;
+  syncSheet(); render();
+};
+sheetName.addEventListener('change', () => { const L = sheetLv(); if (!L) return; const v = sheetName.value.trim().slice(0, 40); if (v === (L.name || '')) return; L.name = v; touchLevel(L); syncSheetSoon(); render(); });
+document.getElementById('sheetNote').addEventListener('change', e => { const L = sheetLv(); if (!L) return; const v = e.target.value.trim().slice(0, 200); if (v === (L.note || '')) return; L.note = v; syncSheetSoon(); render(); });
+sheetQty.addEventListener('change', () => {
+  const L = sheetLv(); if (!L) return;
+  const newQty = Math.max(0, Math.floor(+sheetQty.value || 0));
+  if (newQty === (L.qty || 0)) return; // 值没变，不处理（避免失焦误触改状态）
+  const oldQty = L.qty || 0;
+  L.qty = newQty;
+  applyQtyStatus(L, oldQty); touchLevel(L); sheetQty.value = L.qty; syncSheetSoon(); render();
+});
+document.getElementById('qtyMinus').onclick = () => { const L = sheetLv(); if (!L) return; const oldQty = L.qty || 0; L.qty = Math.max(0, (L.qty || 0) - 1); applyQtyStatus(L, oldQty); syncSheet(); render(); };
+document.getElementById('qtyPlus').onclick = () => { const L = sheetLv(); if (!L) return; const oldQty = L.qty || 0; L.qty = (L.qty || 0) + 1; applyQtyStatus(L, oldQty); syncSheet(); render(); };
+document.getElementById('sheetPickImg').onclick = () => sheetFile.click();
+sheetDelImg.onclick = () => { const L = sheetLv(); if (L) { deleteImageRef(L.img); L.img = null; syncSheet(); render(); } };
+document.getElementById('sheetDelSlot').onclick = async () => {
+  if (!sheetSlot()) return;
+  if (!(await uiConfirm('删除库位', '删除该库位及全部层级货物信息吗？'))) return;
+  floor().slots[sheetKey].levels.forEach(L => deleteImageRef(L.img));
+  delete floor().slots[sheetKey]; pruneGroups(floor()); closeSheet(); render();
+};
+sheetFile.addEventListener('change', () => {
+  const file = sheetFile.files[0]; sheetFile.value = '';
+  if (!file) return;
+  readImageFile(file, ref => { const L = sheetLv(); if (L) { deleteImageRef(L.img); L.img = ref; touchLevel(L); syncSheet(); render(); toast('图片已保存'); } });
+});
+function readImageFile(file, cb) {
+  if (!file) return;
+  // iPhone 默认 HEIC 格式很多 webview 的 canvas 处理不了，提前拦截给明确提示
+  const name = (file.name || '').toLowerCase();
+  const type = (file.type || '').toLowerCase();
+  if (/heic|heif/.test(type) || /\.hei[c,f]$/.test(name)) {
+    toast('暂不支持 HEIC 格式，请在相册里选 JPEG 格式的照片');
+    return;
+  }
+  if (file.size > 15 * 1024 * 1024) { toast('图片太大（超过15MB）'); return; }
+  const rd = new FileReader();
+  rd.onload = () => {
+    const img = new Image();
+    img.onload = () => {
+      if (!img.width || !img.height) { toast('图片读取失败'); return; }
+      try {
+        const k = Math.min(1, 320 / Math.max(img.width, img.height));
+        const w = Math.max(1, Math.round(img.width * k)), h = Math.max(1, Math.round(img.height * k));
+        const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+        cv.getContext('2d').drawImage(img, 0, 0, w, h);
+        cv.toBlob(async blob => {
+          if (!blob) { toast('图片处理失败'); return; }
+          // 在线时上传服务器，离线时走本地 IndexedDB
+          if (API.online) {
+            try {
+              const fd = new FormData();
+              fd.append('file', blob, 'photo.jpg');
+              const d = await API.req('POST', '/api/upload', fd, true);
+              if (d && d.url) {
+                console.log('[upload] 成功:', d.url);
+                cb(d.url);
+                return;
+              } else {
+                toast('上传返回异常');
+              }
+            } catch (e) {
+              toast('上传失败: ' + e.message);
+              console.warn('[upload] 服务器上传失败，用本地:', e.message);
+            }
+          }
+          const ref = await putImageBlob(blob);
+          if (ref) {
+            imageUrlCache.set(ref, URL.createObjectURL(blob));
+            cb(ref);
+          } else {
+            const url = cv.toDataURL('image/jpeg', 0.82);
+            if (!url || url.length < 1000) { toast('图片处理失败'); return; }
+            cb(url);
+          }
+        }, 'image/jpeg', 0.82);
+      } catch (err) { toast('图片处理失败'); }
+    };
+    img.onerror = () => toast('图片读取失败，请用 JPEG/PNG 格式');
+    img.src = rd.result;
+  };
+  rd.onerror = () => toast('图片读取失败');
+  rd.readAsDataURL(file);
+}
+
+function applyCell(d) {
+  const f = floor();
+  const key = d.dataset.r + ',' + d.dataset.c;
+  const cur = f.slots[key];
+  if (mode === 'erase' || !paintValue) {
+    if (!cur) return;
+    delete f.slots[key]; pruneGroups(f);
+  } else {
+    const v = document.getElementById('paintStatus').value;
+    if (cur) {
+      if (cur.levels.every(L => L.s === v)) return;
+      cur.levels.forEach(L => { L.s = v; touchLevel(L); });
+    } else {
+      const n = Math.max(1, Math.min(12, state.defLevels || 3));
+      f.slots[key] = { levels: Array.from({ length: n }, () => blankLevel()) };
+    }
+  }
+  render();
+}
+
+function slotHasGoods(st) {
+  return !!st && st.levels.some(levelHasGoods);
+}
+// 数量为 0 视为无货：一切展示（清单/地图/货架/MCP）都按"空"处理，编辑窗不受影响
+function levelHasGoods(L) {
+  return !!L && (L.qty || 0) > 0;
+}
+function focusCellInMap(cell) {
+  const wrap = document.getElementById('gridWrap');
+  if (!wrap || !cell) return;
+  const wr = wrap.getBoundingClientRect(), cr = cell.getBoundingClientRect();
+  wrap.scrollLeft += (cr.left - wr.left) - (wrap.clientWidth - cr.width) / 2;
+  wrap.scrollTop += (cr.top - wr.top) - (wrap.clientHeight - cr.height) / 2;
+  cell.classList.add('flash');
+  setTimeout(() => cell.classList.remove('flash'), 950);
+}
+function renderList() {
+  const f = floor();
+  const list = document.getElementById('slotList');
+  let keys = Object.keys(f.slots).sort((a, b) => {
+    const [ra, ca] = a.split(',').map(Number), [rb, cb] = b.split(',').map(Number);
+    return ra - rb || ca - cb;
+  });
+  let zoneSuffix = '';
+  if (activeZone) {
+    const z = f.zones.find(x => x.id === activeZone);
+    if (z) {
+      zoneSuffix = ' · ' + z.name;
+      keys = keys.filter(k => { const [r, c] = k.split(',').map(Number); return r >= z.r0 && r <= z.r1 && c >= z.c0 && c <= z.c1; });
+    } else activeZone = null;
+  }
+  const zoneCount = keys.length;
+  const query = listQuery.trim().toLowerCase();
+  if (listFilter === 'goods') keys = keys.filter(k => slotHasGoods(f.slots[k]));
+  if (listFilter === 'empty') keys = keys.filter(k => !slotHasGoods(f.slots[k]));
+  if (query) keys = keys.filter(k => {
+    const st = f.slots[k];
+    const [r, c] = k.split(',').map(Number);
+    const text = [code(r, c), ...st.levels.map(L => `${L.name || ''} ${statusOf(L.s).name}`)].join(' ').toLowerCase();
+    return text.includes(query);
+  });
+  document.getElementById('listFloor').textContent = '· ' + f.name + zoneSuffix;
+  const countEl = document.getElementById('listCount');
+  if (countEl) countEl.textContent = `${keys.length} / ${zoneCount} 个库位`;
+  document.querySelectorAll('#listFilter [data-list-filter]').forEach(btn => btn.classList.toggle('active', btn.dataset.listFilter === listFilter));
+  const emptyText = query || listFilter !== 'all' ? '没有符合条件的库位。' : (activeZone ? '该区域内还没有库位，在地图上画一些。' : '本层还没有库位，在地图上画一些；查看模式点库位可录入货物信息。');
+  list.innerHTML = keys.length ? '' : `<div class="hint" style="padding:8px">${emptyText}</div>`;
+  keys.forEach(k => {
+    const [r, c] = k.split(',').map(Number);
+    const st = f.slots[k];
+    const row = document.createElement('div');
+    row.className = 'slot-row';
+    const thumbLv = st.levels.find(L => levelHasGoods(L) && imageSrc(L.img));
+    const thumb = thumbLv ? `<img class="thumb" src="${imageSrc(thumbLv.img)}" alt="">` : '';
+    // 每层有货/无货一眼可见
+    const presence = st.levels.map((L, i) => {
+      const has = levelHasGoods(L);
+      return `${i + 1}层<span style="color:${has ? '#16a34a' : '#94a3b8'};font-weight:600">${has ? '有货' : '无货'}</span>`;
+    }).join(' ');
+    // 每层一个小 chip：状态色圆点 + 名称 + 数量（0 也显示），自动换行适配宽窄屏
+    const chips = st.levels.map((L, i) => {
+      const so = statusOf(L.s);
+      const nm = L.name ? esc(L.name) : (levelHasGoods(L) ? '未命名' : '（空）');
+      return `<span class="lvl-chip"><span class="dot" style="background:${so.color || '#e2e8f0'}"></span><span>层${i + 1} ${nm} ×${L.qty || 0}</span></span>`;
+    }).join('');
+    row.innerHTML = `${thumb}<div class="slot-row-main"><div class="slot-row-head"><span class="slot-row-code">${code(r, c)}</span><span class="lvl-presence">${presence}</span></div><div class="lvl-chips">${chips}</div></div><button class="del" title="删除库位" aria-label="删除库位">×</button>`;
+    row.querySelector('.del').onclick = e => { e.stopPropagation(); delete f.slots[k]; pruneGroups(f); render(); };
+    row.onclick = () => {
+      const cell = gridEl.querySelector(`[data-r="${r}"][data-c="${c}"]`);
+      focusCellInMap(cell);
+    };
+    list.appendChild(row);
+  });
+}
+
+function renderStats() {
+  let total = 0, qtyTotal = 0; const n = {};
+  state.floors.forEach(fl => Object.values(fl.slots).forEach(s => {
+    total++;
+    s.levels.forEach(L => { n[L.s] = (n[L.s] || 0) + 1; qtyTotal += L.qty || 0; });
+  }));
+  document.getElementById('stats').innerHTML =
+    `<span class="stat-pill" style="background:#e2e8f0;color:#334155">总库位 <b>${total}</b></span>` +
+    state.statuses.map(s => `<span class="stat-pill" style="background:${s.color};color:${textOn(s.color)}">${esc(s.name)} <b>${n[s.id] || 0}</b></span>`).join('') +
+    `<span class="stat-pill" style="background:#38bdf8;color:#0f172a">总件数 <b>${qtyTotal}</b></span>`;
+}
+function renderLegend() {
+  document.getElementById('legendChips').innerHTML = state.statuses.map(s =>
+    `<span><i style="background:${s.color}"></i>${esc(s.name)}</span>`).join('');
+}
+function syncPaintStatus() {
+  const sel = document.getElementById('paintStatus');
+  const cur = sel.value;
+  sel.innerHTML = state.statuses.map(s => `<option value="${s.id}">${esc(s.name)}</option>`).join('');
+  if (state.statuses.some(s => s.id === cur)) sel.value = cur;
+}
+
+// 状态标签管理
+const statusOverlay = document.getElementById('statusOverlay');
+function renderStatusList() {
+  const list = document.getElementById('statusList');
+  list.innerHTML = '';
+  state.statuses.forEach(s => {
+    const row = document.createElement('div');
+    row.className = 'status-row';
+    row.innerHTML = `<span class="swatch" style="background:${s.color}" title="点击换色"></span>` +
+      `<input type="color" value="${s.color}" tabindex="-1" style="position:absolute;opacity:0;width:0;height:0;pointer-events:none">` +
+      `<span class="sname">${esc(s.name)}${s.builtin ? '（内置）' : ''}</span>` +
+      `<button class="btn sm" data-act="rename">改名</button>` +
+      (s.builtin ? '' : `<button class="btn sm danger" data-act="del">删除</button>`);
+    const sw = row.querySelector('.swatch');
+    const picker = row.querySelector('input[type=color]');
+    sw.onclick = () => picker.click();
+    picker.addEventListener('input', () => { s.color = picker.value; sw.style.background = s.color; });
+    picker.addEventListener('change', () => render());
+    row.querySelector('[data-act=rename]').onclick = async () => {
+      const name = await uiPrompt('重命名状态', s.name);
+      if (name === null || !name) return;
+      s.name = name.slice(0, 12);
+      renderStatusList(); render();
+    };
+    const delBtn = row.querySelector('[data-act=del]');
+    if (delBtn) delBtn.onclick = async () => {
+      if (!(await uiConfirm('删除状态', `删除状态「${s.name}」吗？使用它的层级会自动变为"空"。`))) return;
+      state.statuses = state.statuses.filter(x => x.id !== s.id);
+      state.floors.forEach(fl => Object.values(fl.slots).forEach(slot => slot.levels.forEach(L => { if (L.s === s.id) L.s = 'empty'; })));
+      renderStatusList(); render();
+    };
+    list.appendChild(row);
+  });
+}
+document.getElementById('statusBtn').onclick = () => { renderStatusList(); statusOverlay.hidden = false; };
+document.getElementById('statusClose').onclick = () => { statusOverlay.hidden = true; };
+statusOverlay.addEventListener('click', e => { if (e.target === statusOverlay) statusOverlay.hidden = true; });
+
+/* ===== 货物目录：品类树 + 预存货物 ===== */
+let myRole = null;
+const goodsOverlay = document.getElementById('goodsOverlay');
+let goodsTree = [], goodsUncat = [], goodsSelCat = null; // null = 全部
+
+function catPathName(id) {
+  const path = [];
+  const find = (nodes, target) => {
+    for (const n of nodes) {
+      if (n.id === target) { path.unshift(n.name); return true; }
+      if (find(n.children || [], target)) { path.unshift(n.name); return true; }
+    }
+    return false;
+  };
+  find(goodsTree, id);
+  return path.join(' 〉 ');
+}
+function allGoodsFlat() {
+  const out = [];
+  const walk = nodes => { for (const n of nodes) { (n.items || []).forEach(it => out.push({ ...it, catPath: catPathName(n.id) })); walk(n.children || []); } };
+  walk(goodsTree);
+  goodsUncat.forEach(it => out.push({ ...it, catPath: '未分类' }));
+  return out;
+}
+async function loadCatalog() {
+  if (!API.online) { toast('离线模式不可用'); return false; }
+  const d = await API.get('/api/goods/catalog');
+  goodsTree = d.tree || []; goodsUncat = d.uncategorized || [];
+  return true;
+}
+function renderCatTree() {
+  const el = document.getElementById('catTree');
+  el.innerHTML = '';
+  const mkBtn = (t, title, cls) => { const b = document.createElement('button'); b.className = 'iconbtn' + (cls ? ' ' + cls : ''); b.textContent = t; b.title = title; return b; };
+  const build = (nodes, box, depth) => {
+    nodes.forEach(n => {
+      const wrap = document.createElement('div');
+      wrap.className = 'cat-node';
+      const row = document.createElement('div');
+      row.className = 'cat-row' + (goodsSelCat === n.id ? ' active' : '');
+      row.innerHTML = `<span class="cat-name">${esc(n.name)}</span>`;
+      row.querySelector('.cat-name').onclick = () => { goodsSelCat = (goodsSelCat === n.id ? null : n.id); renderCatTree(); renderGoodsItems(); };
+      const ops = document.createElement('span');
+      ops.className = 'cat-ops';
+      const bAdd = mkBtn('＋', '建子品类');
+      bAdd.onclick = e => { e.stopPropagation(); catCreate(n.id); };
+      const bRen = mkBtn('✎', '改名');
+      bRen.onclick = e => { e.stopPropagation(); catRename(n); };
+      const bDel = mkBtn('🗑', '删除品类（含子品类）', 'danger');
+      bDel.onclick = e => { e.stopPropagation(); catDelete(n); };
+      ops.append(bAdd, bRen, bDel);
+      row.appendChild(ops);
+      wrap.appendChild(row);
+      if ((n.children || []).length) {
+        const kids = document.createElement('div');
+        kids.className = 'cat-kids';
+        build(n.children, kids, depth + 1);
+        wrap.appendChild(kids);
+      }
+      box.appendChild(wrap);
+    });
+  };
+  const allRow = document.createElement('div');
+  allRow.className = 'cat-row' + (goodsSelCat === null ? ' active' : '');
+  allRow.innerHTML = `<span class="cat-name">全部货物</span>`;
+  allRow.onclick = () => { goodsSelCat = null; renderCatTree(); renderGoodsItems(); };
+  el.appendChild(allRow);
+  build(goodsTree, el, 0);
+  if (!goodsTree.length && !goodsUncat.length) {
+    const t = document.createElement('div');
+    t.className = 'hint'; t.textContent = '还没有品类，点右上「＋顶层」先建一个，如 自行车系列。';
+    el.appendChild(t);
+  }
+}
+function renderGoodsItems() {
+  const el = document.getElementById('goodsItemList');
+  const kw = (document.getElementById('goodsSearch').value || '').trim().toLowerCase();
+  let items = allGoodsFlat();
+  if (goodsSelCat !== null) items = items.filter(it => it.category_id === goodsSelCat);
+  if (kw) items = items.filter(it => (it.name || '').toLowerCase().includes(kw) || (it.note || '').toLowerCase().includes(kw));
+  document.getElementById('goodsCatName').textContent = goodsSelCat === null ? '全部货物' : catPathName(goodsSelCat);
+  el.innerHTML = '';
+  if (!items.length) { el.innerHTML = '<div class="hint">没有货物。</div>'; return; }
+  items.forEach(it => {
+    const row = document.createElement('div');
+    row.className = 'goods-row';
+    row.innerHTML = `<div class="gname">${esc(it.name)}${it.note ? `<small>${esc(it.note)}</small>` : ''}</div>` +
+      `<span class="gcat">${esc(it.catPath)}</span>`;
+    const bRen = document.createElement('button'); bRen.className = 'btn sm'; bRen.textContent = '改名';
+    bRen.onclick = async () => {
+      const name = await uiPrompt('改名', it.name);
+      if (name === null || !name) return;
+      const note = await uiPrompt('备注（可选）', it.note || '');
+      if (note === null) return;
+      const oldName = it.name;
+      const res = await API.put(`/api/goods/items/${it.id}`, { name: name.slice(0, 64), note: note.slice(0, 255) });
+      const newName = res.item.name, nLv = res.item.renamed_levels || 0;
+      if (newName !== oldName && state) {
+        // 后端已把库位上同名的层级改名，本地地图状态同步跟上，避免旧名残留
+        state.floors.forEach(fl => Object.values(fl.slots || {}).forEach(slot =>
+          (slot.levels || []).forEach(L => { if (L.name === oldName) L.name = newName; })));
+        save(); render();
+      }
+      await loadCatalog(); renderCatTree(); renderGoodsItems();
+      toast(nLv > 0 ? `已改名，同步了 ${nLv} 个库位` : '已改名');
+    };
+    const bMove = document.createElement('button'); bMove.className = 'btn sm'; bMove.textContent = '换类';
+    bMove.onclick = async () => {
+      const flat = [];
+      const walk = (nodes, prefix) => { for (const n of nodes) { flat.push({ id: n.id, path: (prefix ? prefix + ' 〉 ' : '') + n.name }); walk(n.children || [], (prefix ? prefix + ' 〉 ' : '') + n.name); } };
+      walk(goodsTree, '');
+      const opts = flat.map((c, i) => `${i + 1}. ${c.path}`).join('\n') + '\n0. 未分类';
+      const ans = await uiPrompt('输入编号换品类（0=未分类）\n' + opts, '');
+      if (ans === null) return;
+      const idx = parseInt(ans, 10);
+      if (isNaN(idx) || idx < 0 || idx > flat.length) { toast('编号无效'); return; }
+      await API.put(`/api/goods/items/${it.id}`, { category_id: idx === 0 ? -1 : flat[idx - 1].id });
+      await loadCatalog(); renderCatTree(); renderGoodsItems(); toast('已换品类');
+    };
+    const bDel = document.createElement('button'); bDel.className = 'btn sm danger'; bDel.textContent = '删';
+    bDel.onclick = async () => {
+      if (!(await uiConfirm('删除货物', `从目录删除「${it.name}」吗？已录入库位的货名不受影响。`))) return;
+      await API.del(`/api/goods/items/${it.id}`);
+      await loadCatalog(); renderCatTree(); renderGoodsItems(); toast('已删除');
+    };
+    row.append(bRen, bMove, bDel);
+    el.appendChild(row);
+  });
+}
+async function catCreate(parentId) {
+  const name = await uiPrompt(parentId ? '新建子品类' : '新建顶层品类', '');
+  if (name === null || !name.trim()) return;
+  await API.post('/api/goods/categories', { name: name.trim().slice(0, 64), parent_id: parentId || null });
+  await loadCatalog(); renderCatTree(); toast('已建品类');
+}
+async function catRename(n) {
+  const name = await uiPrompt('品类改名', n.name);
+  if (name === null || !name.trim()) return;
+  await API.put(`/api/goods/categories/${n.id}`, { name: name.trim().slice(0, 64) });
+  await loadCatalog(); renderCatTree(); renderGoodsItems(); toast('已改名');
+}
+async function catDelete(n) {
+  if (!(await uiConfirm('删除品类', `删除「${n.name}」及其子品类吗？里面的货物会移到「未分类」，不丢。`))) return;
+  await API.del(`/api/goods/categories/${n.id}`);
+  if (goodsSelCat === n.id) goodsSelCat = null;
+  await loadCatalog(); renderCatTree(); renderGoodsItems(); toast('已删除');
+}
+async function itemCreate() {
+  const name = await uiPrompt(goodsSelCat ? `在「${catPathName(goodsSelCat)}」下新增货物` : '新增货物（未分类）', '');
+  if (name === null || !name.trim()) return;
+  const note = await uiPrompt('备注（可选）', '');
+  if (note === null) return;
+  await API.post('/api/goods/items', { name: name.trim().slice(0, 64), category_id: goodsSelCat, note: (note || '').slice(0, 255) });
+  await loadCatalog(); renderCatTree(); renderGoodsItems(); toast('已新增');
+}
+document.getElementById('goodsBtn').onclick = async () => {
+  if (!(await loadCatalog())) return;
+  renderCatTree(); renderGoodsItems();
+  goodsOverlay.hidden = false;
+};
+document.getElementById('goodsClose').onclick = () => { goodsOverlay.hidden = true; };
+goodsOverlay.addEventListener('click', e => { if (e.target === goodsOverlay) goodsOverlay.hidden = true; });
+document.getElementById('catAddRoot').onclick = () => catCreate(null);
+document.getElementById('itemAdd').onclick = itemCreate;
+document.getElementById('goodsSearch').addEventListener('input', renderGoodsItems);
+
+/* ===== 录入时从目录选用货物 ===== */
+const pickOverlay = document.getElementById('pickOverlay');
+async function openGoodsPick() {
+  if (!(await loadCatalog())) return;
+  const render = () => {
+    const kw = (document.getElementById('pickSearch').value || '').trim().toLowerCase();
+    const el = document.getElementById('pickList');
+    let items = allGoodsFlat();
+    if (kw) items = items.filter(it => (it.name || '').toLowerCase().includes(kw));
+    el.innerHTML = '';
+    if (!items.length) { el.innerHTML = '<div class="hint">目录里没有匹配的货物，可先去「货物目录」新增。</div>'; return; }
+    items.slice(0, 200).forEach(it => {
+      const row = document.createElement('div');
+      row.className = 'goods-row';
+      row.style.cursor = 'pointer';
+      row.innerHTML = `<div class="gname">${esc(it.name)}</div><span class="gcat">${esc(it.catPath)}</span>`;
+      row.onclick = () => {
+        const L = sheetLv();
+        if (L) { L.name = it.name; touchLevel(L); }
+        sheetName.value = it.name;
+        sheetName.dispatchEvent(new Event('change'));
+        pickOverlay.hidden = true;
+        syncSheet(); render();
+      };
+      el.appendChild(row);
+    });
+  };
+  document.getElementById('pickSearch').value = '';
+  document.getElementById('pickSearch').oninput = render;
+  render();
+  pickOverlay.hidden = false;
+}
+document.getElementById('sheetPickGoods').onclick = openGoodsPick;
+document.getElementById('pickClose').onclick = () => { pickOverlay.hidden = true; };
+pickOverlay.addEventListener('click', e => { if (e.target === pickOverlay) pickOverlay.hidden = true; });
+
+/* ===== 操作日志 ===== */
+const logsOverlay = document.getElementById('logsOverlay');
+let logsPage = 1; const LOGS_PER = 30;
+async function loadLogs() {
+  if (!API.online) { toast('离线模式不可用'); return; }
+  const qv = (document.getElementById('logsSearch').value || '').trim();
+  const d = await API.get('/api/op-logs?' + new URLSearchParams({ q: qv, page: logsPage, per_page: LOGS_PER }));
+  const el = document.getElementById('logsList');
+  el.innerHTML = '';
+  if (!d.items.length) { el.innerHTML = '<div class="hint">没有操作记录。</div>'; }
+  (d.items || []).forEach(lg => {
+    const row = document.createElement('div');
+    row.className = 'log-row';
+    const t = lg.created_at ? lg.created_at.replace('T', ' ').slice(0, 19) : '';
+    row.innerHTML = `<span class="log-time">${esc(t)}</span>` +
+      `<div class="log-body"><span class="log-act">${esc(lg.action)}</span> <span class="log-user">${esc(lg.username || '')}</span>` +
+      (lg.detail ? `<div class="log-detail">${esc(lg.detail)}</div>` : '') + `</div>`;
+    el.appendChild(row);
+  });
+  const pages = Math.max(1, Math.ceil(d.total / LOGS_PER));
+  document.getElementById('logsPageInfo').textContent = `第 ${d.page} / ${pages} 页，共 ${d.total} 条`;
+  document.getElementById('logsPrev').disabled = logsPage <= 1;
+  document.getElementById('logsNext').disabled = logsPage >= pages;
+}
+document.getElementById('logsBtn').onclick = async () => {
+  logsPage = 1;
+  document.getElementById('logsClear').hidden = myRole !== 'admin';
+  try { await loadLogs(); } catch (e) { toast(e.message); return; }
+  logsOverlay.hidden = false;
+};
+document.getElementById('logsClose').onclick = () => { logsOverlay.hidden = true; };
+logsOverlay.addEventListener('click', e => { if (e.target === logsOverlay) logsOverlay.hidden = true; });
+document.getElementById('logsSearchBtn').onclick = () => { logsPage = 1; loadLogs(); };
+document.getElementById('logsSearch').addEventListener('keydown', e => { if (e.key === 'Enter') { logsPage = 1; loadLogs(); } });
+document.getElementById('logsPrev').onclick = () => { if (logsPage > 1) { logsPage--; loadLogs(); } };
+document.getElementById('logsNext').onclick = () => { logsPage++; loadLogs(); };
+document.getElementById('logsClear').onclick = async () => {
+  if (!(await uiConfirm('清空日志', '清空全部操作日志吗？此操作会留一条记录。'))) return;
+  await API.del('/api/op-logs');
+  logsPage = 1; await loadLogs(); toast('已清空');
+};
+document.getElementById('addStatusBtn').onclick = () => {
+  const nameEl = document.getElementById('newStatusName');
+  const name = nameEl.value.trim().slice(0, 12);
+  if (!name) { toast('先输入状态名称'); return; }
+  state.statuses.push({ id: 's' + Date.now().toString(36), name, color: document.getElementById('newStatusColor').value });
+  nameEl.value = '';
+  renderStatusList(); render(); toast('已添加');
+};
+document.getElementById('defLevels').addEventListener('change', e => {
+  state.defLevels = Math.max(1, Math.min(12, +e.target.value || 3));
+  e.target.value = state.defLevels;
+  save();
+});
+document.getElementById('listSearch').addEventListener('input', e => {
+  listQuery = e.target.value;
+  renderList();
+});
+document.getElementById('listFilter').addEventListener('click', e => {
+  const btn = e.target.closest('[data-list-filter]');
+  if (!btn) return;
+  listFilter = btn.dataset.listFilter;
+  renderList();
+});
+// 区域划分：框选矩形范围并命名，点区域名跳转到该范围
+let activeZone = null;
+let zoneDrawing = false, zoneAnchor = null, zoneRect = null;
+function paintZoneRect() {
+  clearZoneRect();
+  if (!zoneAnchor || !zoneRect) return;
+  const r0 = Math.min(zoneAnchor.r, zoneRect.r), r1 = Math.max(zoneAnchor.r, zoneRect.r);
+  const c0 = Math.min(zoneAnchor.c, zoneRect.c), c1 = Math.max(zoneAnchor.c, zoneRect.c);
+  for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) {
+    const d = gridEl.querySelector(`[data-r="${r}"][data-c="${c}"]`);
+    if (d) d.classList.add('zsel');
+  }
+}
+function clearZoneRect() { gridEl.querySelectorAll('.zsel').forEach(d => d.classList.remove('zsel')); }
+function renderZones() {
+  gridEl.querySelectorAll('.zone-box').forEach(e => e.remove());
+  // 用格子的实际 offset 位置来定位（相对已定位的 .grid），量的是现实而非理论值，缩放永远对齐
+  floor().zones.forEach(z => {
+    const c0 = gridEl.querySelector(`[data-r="${z.r0}"][data-c="${z.c0}"]`);
+    const c1 = gridEl.querySelector(`[data-r="${z.r1}"][data-c="${z.c1}"]`);
+    if (!c0 || !c1) return;
+    const box = document.createElement('div');
+    box.className = 'zone-box' + (z.id === activeZone ? ' active' : '');
+    box.style.left = (c0.offsetLeft - 2) + 'px';
+    box.style.top = (c0.offsetTop - 2) + 'px';
+    box.style.width = (c1.offsetLeft + c1.offsetWidth - c0.offsetLeft + 4) + 'px';
+    box.style.height = (c1.offsetTop + c1.offsetHeight - c0.offsetTop + 4) + 'px';
+    const tag = document.createElement('span');
+    tag.className = 'zone-tag';
+    tag.textContent = z.name;
+    tag.onclick = e => { e.stopPropagation(); setActiveZone(z.id); };
+    box.appendChild(tag);
+    gridEl.appendChild(box);
+  });
+}
+function renderGroups() {
+  // 编组标签：挂在组成员最左上那个格子上方；货架视图下不画（卡片徽章代替）
+  document.querySelectorAll('.group-tag').forEach(el => el.remove());
+  if (document.body.classList.contains('mode3d')) return;
+  const fl = floor();
+  (fl.groups || []).forEach(g => {
+    const keys = g.members.filter(k => fl.slots[k]).sort((a, b) => {
+      const [ra, ca] = a.split(',').map(Number), [rb, cb] = b.split(',').map(Number);
+      return ra - rb || ca - cb;
+    });
+    if (!keys.length) return;
+    const [r, c] = keys[0].split(',').map(Number);
+    const cell = gridEl.querySelector(`[data-r="${r}"][data-c="${c}"]`);
+    if (!cell) return;
+    const tag = document.createElement('div');
+    tag.className = 'group-tag';
+    tag.textContent = '▦ ' + g.name + ' · ' + keys.length;
+    tag.style.left = cell.offsetLeft + 'px';
+    tag.style.top = cell.offsetTop + 'px';
+    tag.title = '点击编辑编组「' + g.name + '」';
+    tag.onclick = e => { e.stopPropagation(); startGroupOp(g); };
+    gridEl.appendChild(tag);
+  });
+}
+function renderZoneBar() {
+  const bar = document.getElementById('zoneBar');
+  const zones = floor().zones;
+  bar.innerHTML = '';
+  if (!zones.length) { bar.hidden = true; return; }
+  bar.hidden = false;
+  const mk = (text, cls, fn, parent = bar) => { const b = document.createElement('button'); b.type = 'button'; b.textContent = text; if (cls) b.className = cls; b.onclick = fn; parent.appendChild(b); };
+  mk('全部', activeZone ? '' : 'active', () => setActiveZone(null));
+  zones.forEach(z => mk(z.name, z.id === activeZone ? 'active' : '', () => setActiveZone(z.id)));
+  if (activeZone) {
+    const actions = document.createElement('span');
+    actions.className = 'zone-actions';
+    actions.title = '当前区域操作';
+    bar.appendChild(actions);
+    mk('编辑区域', 'mini', async () => {
+      const z = floor().zones.find(x => x.id === activeZone);
+      if (!z) return;
+      const name = await uiPrompt('重命名区域', z.name);
+      if (name) {
+        z.name = name.slice(0, 12);
+        if (API.online && z.id && !String(z.id).startsWith('z')) {
+          API.put(`/api/zones/${z.id}`, { name: z.name }).catch(err => console.warn('[renameZone]', err.message));
+        }
+        render();
+      }
+    }, actions);
+    mk('删除', 'mini danger', async () => {
+      if (!(await uiConfirm('删除区域', '删除该区域划分吗？区域内的库位和货物不受影响。'))) return;
+      const zid = activeZone;
+      // 同步到服务器（数字 ID 才是服务器的）
+      if (API.online && zid && !String(zid).startsWith('z')) {
+        try { await API.del(`/api/zones/${zid}`); } catch (e) { console.warn('[delZone]', e.message); }
+      }
+      floor().zones = floor().zones.filter(x => x.id !== activeZone);
+      activeZone = null; render();
+    }, actions);
+  }
+}
+function setActiveZone(id) {
+  activeZone = id;
+  render();
+  if (id) {
+    const z = floor().zones.find(x => x.id === id);
+    if (z) jumpToZone(z);
+  }
+}
+function jumpToZone(z) {
+  const cell = gridEl.querySelector(`[data-r="${z.r0}"][data-c="${z.c0}"]`);
+  // 只滚动地图视口，避免 scrollIntoView 把整页其它元素一起带动。
+  if (cell) focusCellInMap(cell);
+}
+document.getElementById('zoneBtn').onclick = () => {
+  if (!zoneDrawing && batchOp) exitBatch(true); // 开区域框选前先退出批量模式
+  if (!zoneDrawing && groupOp) exitGroup(true);
+  zoneDrawing = !zoneDrawing;
+  document.getElementById('zoneBtn').classList.toggle('active', zoneDrawing);
+  zoneAnchor = zoneRect = null;
+  clearZoneRect();
+  syncTouchAction();
+  toast(zoneDrawing ? '在地图上拖拽框选一个矩形区域' : '已退出区域划分');
+};
+// 工具栏事件
+document.getElementById('modeSeg').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  if (batchOp) exitBatch(true);
+  if (groupOp) exitGroup(true);
+  mode = b.dataset.mode;
+  document.querySelectorAll('#modeSeg button').forEach(x => x.classList.toggle('active', x === b));
+  syncTouchAction();
+});
+// 3D 视图开关：只改变显示方式，数据与功能不变；3D 下强制查看模式
+document.getElementById('view3dBtn').onclick = () => {
+  const on = document.body.classList.toggle('mode3d');
+  document.getElementById('view3dBtn').textContent = on ? '地图视图' : '货架视图';
+  if (on && (mode === 'paint' || mode === 'erase')) {
+    mode = 'pan';
+    document.querySelectorAll('#modeSeg button').forEach(x => x.classList.toggle('active', x.dataset.mode === 'pan'));
+    syncTouchAction();
+  }
+  render();
+};
+document.getElementById('addFloor').onclick = async () => {
+  const name = await uiPrompt('新增楼层', (state.floors.length + 1) + 'F');
+  if (name === null) return;
+  const newFloor = { name: name || (state.floors.length + 1) + 'F', rows: 8, cols: 14, slots: {}, zones: [] };
+  const newIdx = state.floors.length;
+  state.floors.push(newFloor);
+  // 同步到服务器
+  if (API.online && API.warehouseId) {
+    try {
+      const d = await API.post(`/api/warehouses/${API.warehouseId}/floors`, { name: newFloor.name, rows: 8, cols: 14 });
+      API.floorIdMap[newIdx] = d.floor.id;
+    } catch (e) { console.warn('[addFloor] 服务器同步失败:', e.message); }
+  }
+  state.active = newIdx; activeZone = null; basePx = 0; syncSizeInputs(); render();
+};
+document.getElementById('delFloor').onclick = async () => {
+  if (state.floors.length <= 1) { toast('至少保留一层'); return; }
+  if (!(await uiConfirm('删除楼层', '删除楼层「' + floor().name + '」吗？'))) return;
+  const fid = API.floorIdMap[state.active];
+  if (API.online && fid) {
+    try { await API.del(`/api/floors/${fid}`); } catch (e) { console.warn('[delFloor]', e.message); }
+  }
+  state.floors.splice(state.active, 1);
+  // 重建 floorIdMap（索引变了）
+  const newMap = {};
+  let ni = 0;
+  for (let i = 0; i <= state.floors.length; i++) {
+    if (i === state.active) continue;
+    if (API.floorIdMap[i]) newMap[ni] = API.floorIdMap[i];
+    ni++;
+  }
+  API.floorIdMap = newMap;
+  state.active = Math.max(0, state.active - 1); activeZone = null; basePx = 0; syncSizeInputs(); render();
+};
+document.getElementById('floorName').addEventListener('change', e => {
+  const v = e.target.value.trim(); if (v) {
+    floor().name = v;
+    const fid = API.floorIdMap[state.active];
+    if (API.online && fid) API.put(`/api/floors/${fid}`, { name: v }).catch(err => console.warn('[renameFloor]', err.message));
+    render();
+  }
+});
+function syncSizeInputs() {
+  document.getElementById('rows').value = floor().rows;
+  document.getElementById('cols').value = floor().cols;
+  document.getElementById('defLevels').value = state.defLevels || 3;
+}
+document.getElementById('applySize').onclick = () => {
+  const f = floor();
+  const rows = Math.max(1, Math.min(40, +document.getElementById('rows').value || 8));
+  const cols = Math.max(1, Math.min(60, +document.getElementById('cols').value || 14));
+  basePx = 0; // 列数变化，基准格子尺寸重算
+  Object.keys(f.slots).forEach(k => {
+    const [r, c] = k.split(',').map(Number);
+    if (r >= rows || c >= cols) delete f.slots[k];
+  });
+  f.rows = rows; f.cols = cols;
+  pruneGroups(f);
+  f.zones = f.zones.filter(z => z.r0 < rows && z.c0 < cols).map(z => ({ ...z, r1: Math.min(z.r1, rows - 1), c1: Math.min(z.c1, cols - 1) }));
+  const fid = API.floorIdMap[state.active];
+  if (API.online && fid) API.put(`/api/floors/${fid}`, { rows, cols }).catch(err => console.warn('[resizeFloor]', err.message));
+  render();
+};
+document.getElementById('undoBtn').onclick = undoLast;
+document.getElementById('restoreBtn').onclick = restoreBackup;
+document.getElementById('clearBtn').onclick = async () => {
+  if (!(await uiConfirm('清空本层', '清空楼层「' + floor().name + '」的全部库位吗？'))) return;
+  floor().slots = {}; pruneGroups(floor()); render();
+};
+document.getElementById('exportBtn').onclick = () => {
+  if (API.online && API.warehouseId) {
+    // 在线：下载 ZIP 备份包（backup.json + 图片原文件）。图片是二进制直装，
+    // 不再 base64 膨胀，浏览器只负责下载，不必把整个备份读进内存。
+    const a = document.createElement('a');
+    a.href = `/api/warehouses/${API.warehouseId}/backup-archive`;
+    a.download = '';
+    document.body.appendChild(a); a.click(); a.remove();
+    toast('备份包下载中（数据 + 图片）');
+    return;
+  }
+  // 离线兜底：导出本地 JSON（图片为本地引用，无法跨设备打包）
+  const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'warehouse-map.json'; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+};
+document.getElementById('importBtn').onclick = () => document.getElementById('importFile').click();
+document.getElementById('importFile').addEventListener('change', async e => {
+  const file = e.target.files[0]; if (!file) return;
+  try {
+    const isZip = /\.zip$/i.test(file.name)
+      || file.type === 'application/zip' || file.type === 'application/x-zip-compressed';
+    if (isZip) {
+      // 压缩包：原样发服务器解压恢复，浏览器不解压、不读图
+      if (!API.online) { toast('离线无法导入压缩包（需服务器处理）'); return; }
+      const fd = new FormData(); fd.append('file', file);
+      const resp = await fetch('/api/import-archive', { method: 'POST', body: fd, credentials: 'same-origin' });
+      if (!resp.ok) {
+        let msg = '服务器拒绝导入（' + resp.status + '）';
+        try { const j = await resp.json(); if (j && j.detail) msg = '服务器拒绝导入: ' + j.detail; } catch (_) {}
+        toast(msg); return;
+      }
+      const res = await resp.json();
+      await bootFromServer();
+      toast('导入成功'
+        + (res.images_written ? `，${res.images_written} 张图片已恢复` : '')
+        + (res.images_missing ? `，${res.images_missing} 张引用图片缺失` : ''));
+      return;
+    }
+    const text = await new Promise((res, rej) => {
+      const rd = new FileReader();
+      rd.onload = () => res(rd.result); rd.onerror = rej;
+      rd.readAsText(file);
+    });
+    const s = JSON.parse(text);
+    if (!s.floors || !Array.isArray(s.floors)) throw new Error('bad');
+    if (API.online) {
+      // 在线 JSON：发服务器全量导入，保证刷新不丢；包里带的本地图片（base64）一并恢复
+      let res;
+      try {
+        res = await API.post('/api/import', { statuses: s.statuses || [], floors: s.floors, images: s.images || {} });
+      } catch (err) { toast('服务器拒绝导入: ' + err.message); return; }
+      await bootFromServer();
+      const n = (res && res.images_written) || 0, miss = (s.images_missing || []).length;
+      toast('导入成功' + (n ? `，${n} 张图片已恢复` : '') + (miss ? `，${miss} 张图片文件缺失` : ''));
+      return;
+    }
+    state = s; normalizeState(); state.active = 0; activeZone = null; basePx = 0;
+    syncSizeInputs(); render();
+    hydrateImages().then(() => { render(); return migrateLegacyImages(); });
+    toast('已导入（离线，仅本地）');
+  } catch (err) { toast('文件格式不对'); }
+  finally { e.target.value = ''; }
+});
+
+(async () => {
+  document.getElementById('loginBtn').onclick = doLogin;
+  document.getElementById('loginPass').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+  document.getElementById('loginOfflineBtn').onclick = () => {
+    hideLogin();
+    try { const raw = localStorage.getItem(LS_KEY); if (raw) state = JSON.parse(raw); } catch (e) {}
+    normalizeState(); lastSavedJson = JSON.stringify(state);
+    syncSizeInputs(); render();
+    hydrateImages().then(() => { render(); return migrateLegacyImages(); });
+  };
+  // 从后端取版本号显示
+  fetch('/api/version').then(r => r.json()).then(d => {
+    if (d.version) document.getElementById('verTag').textContent = 'v' + d.version;
+  }).catch(() => {});
+  try { await load(); }
+  catch (e) { if (e.code === 401) return; throw e; }
+  syncSizeInputs(); render();
+  hydrateImages().then(() => { render(); return migrateLegacyImages(); });
+})();
