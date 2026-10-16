@@ -116,6 +116,16 @@ def save_map(fid: int, data: MapSave, user: models.User = Depends(require_role("
                 "status_key": lv.status_key, "name": lv.name or "", "qty": lv.qty or 0,
                 "note": lv.note or "", "img_path": lv.img_path}
     old_n_group = db.query(models.SlotGroup).filter(models.SlotGroup.floor_id == fid).count()
+    # 旧编组明细（日志 diff 用）：[(名称, 排序后成员"r,c"元组)]
+    import json as _json2
+    old_groups = []
+    for g in db.query(models.SlotGroup).filter(models.SlotGroup.floor_id == fid)\
+            .order_by(models.SlotGroup.sort_order, models.SlotGroup.id).all():
+        try:
+            _members = tuple(sorted(str(m) for m in (_json2.loads(g.members or "[]") or [])))
+        except Exception:
+            _members = ()
+        old_groups.append((g.name or "", _members))
     # 清旧库位：先显式删层级，再删库位（不依赖数据库级联行为）
     old_slot_ids = [s.id for s in old_slots]
     if old_slot_ids:
@@ -150,6 +160,7 @@ def save_map(fid: int, data: MapSave, user: models.User = Depends(require_role("
             db.add(models.Level(slot_id=slot.id, level_index=i, **norm))
             n_level += 1
     n_group = 0
+    new_groups = []  # [(名称, 排序后成员"r,c"元组)]，日志 diff 用
     if data.groups is not None:
         # 带 groups 字段保存：全量替换该楼层编组；成员须是已保存的库位，一个库位只进一个组
         import json as _json
@@ -169,21 +180,92 @@ def save_map(fid: int, data: MapSave, user: models.User = Depends(require_role("
             db.add(models.SlotGroup(floor_id=fid, name=name, members=_json.dumps(members),
                                     sort_order=order))
             n_group += 1
+            new_groups.append((name, tuple(sorted(members))))
+    elif data.groups is None:
+        # 没带 groups 字段：编组原样保留，不算改动
+        n_group = old_n_group
+        new_groups = list(old_groups)
     # 新旧 diff：只记真正的改动
     changes = []
-    old_slot_keys = {(r, c) for (r, c, _i) in old_levels}
-    new_slot_keys = {(r, c) for (r, c, _i) in new_levels}
-    for (r, c) in sorted(new_slot_keys - old_slot_keys):
-        changes.append(f"新增库位 {_code(r, c)}")
-    for (r, c) in sorted(old_slot_keys - new_slot_keys):
-        changes.append(f"删除库位 {_code(r, c)}")
+    # 库位内容签名：每层 (序号, 状态, 货名, 数量, 备注, 有无图片)
+    def _slot_sig(levels_dict, r, c):
+        idxs = sorted({k[2] for k in levels_dict if k[0] == r and k[1] == c})
+        sig = []
+        for i in idxs:
+            lv = levels_dict[(r, c, i)]
+            sig.append((i, lv.get("status_key"), lv.get("name") or "",
+                        lv.get("qty") or 0, lv.get("note") or "",
+                        bool(lv.get("img_path"))))
+        return tuple(sig)
+    old_sigs = {(s.r, s.c): _slot_sig(old_levels, s.r, s.c) for s in old_slots}
+    new_sigs = {}
+    for _key in saved_keys:
+        try:
+            _rr, _cc = _key.split(","); _r, _c = int(_rr), int(_cc)
+        except ValueError:
+            continue
+        new_sigs[(_r, _c)] = _slot_sig(new_levels, _r, _c)
+    _deleted = sorted(set(old_sigs) - set(new_sigs))
+    _added = sorted(set(new_sigs) - set(old_sigs))
+    # 1) 移动：删掉的位置与新增的位置内容完全一致
+    _moves = []  # [(from_r,from_c),(to_r,to_c)]
+    _rem_del, _rem_add = list(_deleted), list(_added)
+    for _d in _deleted:
+        for _a in list(_rem_add):
+            if old_sigs[_d] == new_sigs[_a]:
+                _moves.append((_d, _a))
+                _rem_add.remove(_a); _rem_del.remove(_d)
+                break
+    for (_r1, _c1), (_r2, _c2) in _moves:
+        changes.append(f"移动库位 {_code(_r1, _c1)}→{_code(_r2, _c2)}")
+    # 2) 复制：新增位置内容与某个原位未动的库位完全一致
+    for _a in list(_rem_add):
+        for _pos in sorted(set(old_sigs) & set(new_sigs)):
+            if new_sigs[_a] == old_sigs[_pos] and old_sigs[_pos] == new_sigs[_pos]:
+                changes.append(f"复制库位 {_code(*_pos)}→{_code(*_a)}")
+                _rem_add.remove(_a)
+                break
+    for (_r, _c) in _rem_add:
+        changes.append(f"新增库位 {_code(_r, _c)}")
+    for (_r, _c) in _rem_del:
+        changes.append(f"删除库位 {_code(_r, _c)}")
     for key in sorted(set(old_levels) & set(new_levels)):
         r, c, i = key
         d = _level_diff(db, wid, _code(r, c), i, old_levels[key], new_levels[key])
         if d:
             changes.append(d)
-    if n_group != old_n_group:
-        changes.append(f"编组 {old_n_group}→{n_group}")
+    # 3) 编组 diff：成员位置按库位移动做换算，避免"移动库位"连带误报"成员变更"
+    _move_map = {f"{_r1},{_c1}": f"{_r2},{_c2}" for (_r1, _c1), (_r2, _c2) in _moves}
+    def _trans(members):
+        return tuple(sorted(_move_map.get(m, m) for m in members))
+    _og = [(_n, _trans(_m)) for _n, _m in old_groups]
+    _ng = list(new_groups)
+    _used_o, _used_n = set(), set()
+    # 先按成员配对：成员一致 → 改名或无变化
+    for _oi, (_on, _om) in enumerate(_og):
+        for _ni, (_nn, _nm) in enumerate(_ng):
+            if _ni in _used_n or _om != _nm:
+                continue
+            _used_o.add(_oi); _used_n.add(_ni)
+            if _on != _nn:
+                changes.append(f"编组「{_on}」改名「{_nn}」")
+            break
+    # 再按名称配对：名称一致 → 成员变化
+    for _oi, (_on, _om) in enumerate(_og):
+        if _oi in _used_o:
+            continue
+        for _ni, (_nn, _nm) in enumerate(_ng):
+            if _ni in _used_n or _on != _nn:
+                continue
+            _used_o.add(_oi); _used_n.add(_ni)
+            changes.append(f"编组「{_nn}」成员 {len(_om)}→{len(_nm)}个库位")
+            break
+    for _oi, (_on, _om) in enumerate(_og):
+        if _oi not in _used_o:
+            changes.append(f"删除编组「{_on}」")
+    for _ni, (_nn, _nm) in enumerate(_ng):
+        if _ni not in _used_n:
+            changes.append(f"新建编组「{_nn}」({len(_nm)}个库位)")
     db.commit()
     if changes:
         detail = f"保存楼层「{f.name}」地图：" + "；".join(changes[:12])

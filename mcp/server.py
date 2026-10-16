@@ -724,6 +724,8 @@ async def call_tool(name: str, arguments: dict):
                                 {"fid": fid}).mappings().first()["m"] + 1
                 gid = db.execute(text("INSERT INTO slot_groups (floor_id, name, members, sort_order) VALUES (:fid,:nm,:mem,:so) RETURNING id"),
                                  {"fid": fid, "nm": name_g[:64], "mem": json.dumps(keys), "so": so}).mappings().first()["id"]
+                db.execute(text("INSERT INTO op_logs (action, detail) VALUES ('mcp.wms_create_group', :d)"),
+                           {"d": f"新建编组「{name_g[:64]}」({len(keys)}个库位)"})
                 db.commit()
             finally:
                 db.close()
@@ -762,6 +764,16 @@ async def call_tool(name: str, arguments: dict):
                 if new_name is not None: sets.append("name=:nm"); params["nm"] = new_name
                 if new_members is not None: sets.append("members=:mem"); params["mem"] = json.dumps(new_members)
                 db.execute(text(f"UPDATE slot_groups SET {', '.join(sets)} WHERE id=:gid"), params)
+                _old_name = g["name"] or ""
+                _old_n = len(json.loads(g["members"] or "[]") or [])
+                _bits = []
+                if new_name is not None and new_name != _old_name:
+                    _bits.append(f"编组「{_old_name}」改名「{new_name}」")
+                if new_members is not None and len(new_members) != _old_n:
+                    _bits.append(f"编组「{new_name if new_name is not None else _old_name}」成员 {_old_n}→{len(new_members)}个库位")
+                if _bits:
+                    db.execute(text("INSERT INTO op_logs (action, detail) VALUES ('mcp.wms_update_group', :d)"),
+                               {"d": "；".join(_bits)})
                 db.commit()
             finally:
                 db.close()
@@ -776,6 +788,8 @@ async def call_tool(name: str, arguments: dict):
             db = Session()
             try:
                 db.execute(text("DELETE FROM slot_groups WHERE id=:gid"), {"gid": gid})
+                db.execute(text("INSERT INTO op_logs (action, detail) VALUES ('mcp.wms_delete_group', :d)"),
+                           {"d": f"删除编组「{g['name']}」"})
                 db.commit()
             finally:
                 db.close()
