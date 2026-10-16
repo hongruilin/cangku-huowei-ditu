@@ -1,6 +1,6 @@
 # 仓库货位地图（开源 WMS）
 
-![version](https://img.shields.io/badge/version-v2.8.14-blue) ![license](https://img.shields.io/badge/license-MIT-green)
+![version](https://img.shields.io/badge/version-v2.8.17-blue) ![license](https://img.shields.io/badge/license-MIT-green)
 
 免费开源的仓库管理系统，适合小仓库、电商仓、工厂库房：自己画仓库地图，每个货位按层管理货物，一眼看到每层的名称、数量、状态和照片；手机和电脑都能用，Docker 一条命令部署。
 
@@ -13,6 +13,16 @@
 ---
 
 ## 最新更新
+
+**v2.8.17（2026-10-16）— MCP 编组工具补操作日志**
+- `wms_create_group` / `wms_update_group` / `wms_delete_group` 之前不记操作日志，现已补上（新建／改名／成员变化／删除，格式与前端 `map.save` 一致）
+
+**v2.8.16（2026-10-16）— 操作日志：移动/复制识别 + 编组明细**
+- 移动库位不再记成"新增+删除"，改为"移动库位 D-03→A-03"（按库位内容签名识别）；新增"复制库位 A-03→B-05"识别
+- 编组日志细化：新建编组／删除编组／改名／成员数量变化；库位移动时编组成员跟随不再误报"成员变更"
+
+**v2.8.15（2026-10-16）— 修复操作日志时间慢 8 小时**
+- 数据库存的是 UTC 时间（带时区），前端直接切字符串丢掉了时区；现用 `fmtLocalTime` 正确解析时区后转本地时间显示
 
 **v2.8.14（2026-10-14）— 前端单文件拆分**
 - 131KB 的 `index.html` 拆为结构/样式/逻辑三文件（`index.html` + `styles.css` + `app.js`），功能零改动，UI 回归测试通过

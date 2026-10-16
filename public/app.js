@@ -288,6 +288,15 @@ function restoreBackup() {
 const floor = () => state.floors[state.active];
 const code = (r, c) => String.fromCharCode(65 + r) + '-' + String(c + 1).padStart(2, '0');
 const esc = s => String(s).replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
+// ISO 时间（含时区，如 2026-10-16T09:36:00+00:00）转本地 "YYYY-MM-DD HH:mm:ss" 显示
+// 之前直接 slice 字符串会丢掉时区，UTC 时间被当成本地时间显示（慢 8 小时）
+const fmtLocalTime = iso => {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d)) return String(iso).replace('T', ' ').slice(0, 19);
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+};
 function normLevel(l) {
   const ok = v => state.statuses.some(s => s.id === v);
   const goodImg = v => (typeof v === 'string' && (v.startsWith('data:image') || v.startsWith('idb:') || v.startsWith('/uploads/') || v.startsWith('blob:') || /^https?:\/\//.test(v))) ? v : null;
@@ -1540,7 +1549,7 @@ async function loadLogs() {
   (d.items || []).forEach(lg => {
     const row = document.createElement('div');
     row.className = 'log-row';
-    const t = lg.created_at ? lg.created_at.replace('T', ' ').slice(0, 19) : '';
+    const t = fmtLocalTime(lg.created_at);
     row.innerHTML = `<span class="log-time">${esc(t)}</span>` +
       `<div class="log-body"><span class="log-act">${esc(lg.action)}</span> <span class="log-user">${esc(lg.username || '')}</span>` +
       (lg.detail ? `<div class="log-detail">${esc(lg.detail)}</div>` : '') + `</div>`;
